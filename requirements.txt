@@ -1,0 +1,11 @@
+pandas
+numpy
+scikit-learn
+xgboost
+pyodbc
+sqlalchemy
+pyyaml
+joblib
+matplotlib
+pytest
+python-dotenv

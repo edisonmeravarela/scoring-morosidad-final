@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+models/*.pkl
+models/*.csv
+logs/*.log
+.venv/

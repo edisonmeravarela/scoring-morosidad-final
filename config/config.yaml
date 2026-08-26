@@ -1,0 +1,213 @@
+# Configuración no sensible del pipeline de scoring de morosidad.
+# El servidor, la base de datos, el usuario y la contraseña NUNCA se
+# escriben aquí: siempre se leen de variables de entorno (ver .env.example
+# en la raíz del proyecto), cargadas por src/db.py con python-dotenv.
+
+database:
+  driver: "ODBC Driver 17 for SQL Server"
+  timeout: 30
+
+extract:
+  # vista_features: usada en INFERENCIA (score.py) — un cliente hoy, con
+  # todo su historial legítimamente pasado.
+  vista_features: "dbo.vw_FeaturesScoringCliente"
+  minimo_clientes: 30
+  # vista_entrenamiento: usada en ENTRENAMIENTO (train.py) — una fila por
+  # factura, con variables point-in-time (solo historial previo a esa
+  # factura) para no filtrar la etiqueta hacia las variables. Ver ajuste
+  # de la sección "leakage" tras el paso 8.4.
+  vista_entrenamiento: "dbo.vw_DatasetEntrenamientoFactura"
+  minimo_facturas: 30
+
+features:
+  # Número de tramos (cortes de cuantiles) objetivo por variable numérica;
+  # con pocos datos o valores muy repetidos, qcut puede generar menos.
+  n_tramos: 5
+  # Information Value: umbral mínimo para conservar una variable (sección
+  # 8.4) y umbral máximo — por encima de esto, la variable probablemente
+  # es una fuga de la etiqueta, no una señal predictiva real (ajuste
+  # post-8.4 para dbo.vw_DatasetEntrenamientoFactura).
+  iv_minimo: 0.02
+  iv_maximo: 1.0
+  ruta_mapeo: "models/mapeo_woe.pkl"
+  # Categorías con menos de este número de casos se agrupan en "OTRAS"
+  # antes de calcular WOE (evita tramos con 1-2 observaciones); esa misma
+  # categoría "OTRAS" es el destino de cualquier valor no visto en
+  # entrenamiento al transformar datos nuevos (scoring).
+  min_conteo_categoria: 5
+  # Columnas de las vistas que no se discretizan/WOE-codifican en absoluto:
+  # identificador, texto libre, catálogos ya asignados (estado actual, no
+  # comportamiento) y, en la vista de entrenamiento, claves e indicadores
+  # de filtro. VendedorId/CiudadId NO van aquí: son "Propias de la factura"
+  # (sección 5 del documento) y se codifican como categóricas, no se excluyen.
+  variables_excluidas:
+    # dbo.vw_FeaturesScoringCliente (inferencia)
+    - NombreCompleto
+    - SegmentoActualId
+    - ClasificacionActualId
+    - PlazoPagoActualId
+    # dbo.vw_DatasetEntrenamientoFactura (entrenamiento)
+    - ClienteId
+    - NumeroFactura
+    - FechaEmision
+    - FechaVencimiento
+    - SinHistorialPago
+  # Variables sin orden natural: se codifican con WOE por categoría (cada
+  # valor distinto es su propio tramo), no por cuantiles. VendedorId no
+  # existe en vw_FeaturesScoringCliente y CiudadId existe en ambas vistas;
+  # variables_categoricas_candidatas() solo usa las que estén presentes.
+  variables_categoricas:
+    - VendedorId
+    - CiudadId
+
+entrenamiento:
+  # Columnas del dataset de dbo.vw_DatasetEntrenamientoFactura relevantes
+  # para el split y la etiqueta (no son variables del modelo).
+  columna_fecha: "FechaEmision"
+  columna_target: "Target"
+  columna_cliente: "ClienteId"
+  # Filas con SinHistorialPago = 1 (cliente sin facturas previas ya
+  # vencidas) no tienen comportamiento que aprender; las resuelve la regla
+  # de negocio NUEVO en la Capa 2, no el modelo.
+  excluir_sin_historial: true
+  # Split temporal (sección 6 del documento: "entrenar con datos hasta
+  # hace 6 meses, validar con los últimos 6"), nunca aleatorio. Además,
+  # cualquier cliente que caiga en ambos lados se purga de validación
+  # (sección 4.4, "Agrupación por cliente"): un mismo cliente no debe
+  # aparecer en entrenamiento y validación a la vez.
+  meses_validacion: 6
+  class_weight: "balanced"
+  entrenar_xgboost: true
+  # Criterios de aceptación del paso 8.5: KS mínimo de validación, y el
+  # "test de fuga" — detener el entrenamiento si el AUC de validación
+  # supera este techo, porque en scoring crediticio real 0.75–0.85 es un
+  # buen modelo y ~0.98 casi siempre significa que algo se filtró.
+  ks_minimo: 0.25
+  auc_maximo_sospechoso: 0.95
+  # Escalado del score tipo FICO: score = offset + factor * ln(odds_bueno).
+  # Anclas arbitrarias mientras no haya tasa de mora observada para
+  # calibrar contra percentiles reales (sección 7): revisar cuando el área
+  # de crédito tenga criterio sobre qué score debería tener un cliente típico.
+  score_base: 600
+  odds_base: 50
+  pdo: 20
+  ruta_modelo: "models/modelo.pkl"
+  ruta_scorecard: "models/scorecard.csv"
+
+score:
+  # Paso 8.6: score.py hace inferencia sobre dbo.vw_FeaturesScoringCliente
+  # (una fila por cliente, estado actual), pero el modelo se entrenó sobre
+  # dbo.vw_DatasetEntrenamientoFactura (una fila por factura, point-in-time).
+  # Sección 4.3 del documento: "las definiciones de cada variable deben
+  # coincidir entre ambas vistas". Esta tabla traduce el nombre de cada
+  # variable del modelo (izquierda, vista de entrenamiento) a su
+  # equivalente en la vista de cliente (derecha). Si una variable no
+  # aparece aquí, se asume el mismo nombre en las dos vistas (p.ej.
+  # CiudadId, DiasAntiguedadCliente).
+  #
+  # Cuatro variables no tienen equivalente real a nivel de cliente porque
+  # describen una factura puntual (su monto exacto, cuántas facturas hace
+  # un cliente al mes, cuántas quedaron resueltas) o al vendedor que la
+  # emitió — a nivel de cliente agregado eso no existe como tal. Se marcan
+  # con null: su contribución al score se fija en WOE=0 (neutra) en vez de
+  # inventar un valor o fallar.
+  mapa_variables_inferencia:
+    MontoFactura: ValorFacturaPromedio
+    NumFacturasPrevias: NumFacturas
+    MontoPromedioPrevio: ValorFacturaPromedio
+    MontoAcumuladoPrevio: ValorTotalFacturado
+    DiasDesdeFacturaAnterior: DiasDesdeUltimaFactura
+    FacturasPorMes: null
+    NumFacturasResueltas: null
+    DiasPagoDesviacionPrevia: DiasPagoDesviacion
+    DiasMoraPromedioPrevio: DiasMoraPromedio
+    DiasMoraMaximaPrevia: DiasMoraMaxima
+    AbonosPorFacturaPrevio: AbonosPorFacturaPromedio
+    PorcMoraPrevia: PorcFacturasEnMora
+    PorcMoraPrevia6M: PorcMoraUltimos6Meses
+    SaldoVigenteEmision: SaldoActualTotal
+    FacturasAbiertasEmision: NumFacturasConSaldo
+    SaldoVencidoEmision: null
+    VendedorId: null   # no existe en vw_FeaturesScoringCliente (no es una columna de cliente)
+  # Rango nominal del score tipo FICO (documento, sección 7: "0 a 1000").
+  score_min: 0
+  score_max: 1000
+
+reglas:
+  # Paso 8.7 (Capa 2, secciones 3 y 7). Todos los umbrales que introduce
+  # este módulo se leen de aquí, nunca fijos en el código (criterio del
+  # propio paso 8.7). Los valores que YA viven en los catálogos de la
+  # base de datos (LimiteCredito y DiasMaxMora por SegmentoRiesgo, Dias
+  # por PlazoPago — sección 3.1: "modificar la política es un UPDATE en
+  # base de datos, no un cambio de código") NO se duplican aquí: rules.py
+  # los consulta en vivo contra dbo.SegmentoRiesgo/dbo.PlazoPago. Lo que
+  # sí vive aquí es lo que no tiene una fila propia en ningún catálogo:
+  # los cortes de score, los umbrales de anulación y de clasificación RFM,
+  # y el mapeo segmento -> nombre de plazo.
+
+  # 7. "De la probabilidad al segmento de riesgo": cortes de score contra
+  # el Codigo de dbo.SegmentoRiesgo. Tramos [inferior, hasta]; el último
+  # (hasta=null) no tiene techo. Verificado contra el ejemplo del
+  # documento (sección 3.3): score 415 cae en "300 a 500" -> ALTO.
+  cortes_score:
+    - {hasta: 300, segmento: "CRITICO"}
+    - {hasta: 500, segmento: "ALTO"}
+    - {hasta: 700, segmento: "MEDIO"}
+    - {hasta: null, segmento: "BAJO"}
+
+  # 3.2 Paso 2 (reglas de anulación) y 8.7: condiciones duras que
+  # sobrescriben el segmento del paso anterior sin importar el score.
+  # "NUEVO" no es un Codigo de dbo.SegmentoRiesgo (que solo tiene
+  # BAJO/MEDIO/ALTO/CRITICO): es un marcador interno de "sin historial
+  # suficiente para evaluar riesgo" que solo usan recomendar_plazo (para
+  # forzar CONTADO) y clasificar_cliente (que ya lo devuelve por defecto
+  # en este caso, sección 7).
+  dias_mora_critico: 90
+  minimo_facturas_para_evaluar: 3
+
+  # 7. Plazo de pago recomendado por segmento (Nombre de dbo.PlazoPago).
+  # El documento describe BAJO como "60 a 90 días" (un rango); el
+  # catálogo solo admite un valor discreto por plazo, así que se toma el
+  # extremo más conservador (60) — ajustar aquí si el área de crédito
+  # prefiere el otro extremo.
+  plazo_por_segmento:
+    BAJO: "60 DÍAS"
+    MEDIO: "30 DÍAS"
+    ALTO: "15 DÍAS"
+    CRITICO: "CONTADO"
+    NUEVO: "CONTADO"
+
+  # Clasificación comercial (RFM), sección 7: eje independiente del
+  # riesgo. Anclas iniciales sin calibrar contra datos reales (mismo caso
+  # que entrenamiento.score_base): Recencia en días desde la última
+  # factura (menos es mejor), Frecuencia en número de facturas, Monto en
+  # valor promedio facturado (más es mejor en ambos).
+  rfm:
+    recencia_dias_buena: 30
+    recencia_dias_regular: 90
+    frecuencia_alta: 10
+    frecuencia_regular: 4
+    monto_alto: 2000
+    monto_regular: 500
+
+writeback:
+  # Paso 8.8: escritura por lotes vía dbo.sp_ActualizarScoringCliente.
+  tamano_lote: 50
+  motivo_por_defecto: "Actualización automática por modelo de scoring"
+
+monitor:
+  # Paso 8.9. Por debajo de este número de reclasificaciones con
+  # facturación posterior observable, el KS en producción no es
+  # confiable (dbo.vw_MonitoreoScoring solo tiene desenlace conocido
+  # para clientes que ya facturaron después de su última reclasificación).
+  minimo_registros: 20
+  # Criterio de aceptación del paso: alerta de reentrenamiento si el KS
+  # actual cae por debajo de este porcentaje del KS de validación (8.5).
+  umbral_ks_relativo: 0.8
+  # Population Stability Index para detectar desviación de datos (data
+  # drift): el mismo estándar de la industria de scoring crediticio que
+  # WOE/IV, aplicado para comparar la distribución de una variable en
+  # producción contra el entrenamiento, en vez de dos clases. Lectura
+  # habitual: <0.1 sin cambio relevante, 0.1-0.25 cambio moderado, >0.25
+  # cambio significativo (umbral de alerta usado aquí).
+  psi_alerta: 0.25
