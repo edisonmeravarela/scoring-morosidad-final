@@ -62,6 +62,35 @@ def test_read_sql_puede_consultar_una_tabla_real_del_esquema():
     assert len(df) <= 5
 
 
+def test_ejecutar_multi_resultset_devuelve_los_dos_result_sets_de_sp_validaresquema():
+    # dbo.sp_ValidarEsquema (control de esquema) devuelve detalle +
+    # veredicto en la misma llamada — pd.read_sql() solo captura el primero.
+    resultados = db.ejecutar_multi_resultset("EXEC dbo.sp_ValidarEsquema @Version = ?", ("1.0",))
+    assert len(resultados) == 2
+    detalle, veredicto = resultados
+    assert {"Objeto", "Columna", "Hallazgo", "Severidad"} <= set(detalle.columns)
+    assert {"Criticos", "Advertencias"} <= set(veredicto.columns)
+    assert len(veredicto) == 1
+
+
+def test_ejecutar_y_ejecutar_muchos_escriben_de_verdad():
+    # Verificación en vivo con una tabla propia y descartable del test
+    # (no una temporal: cada ejecutar()/ejecutar_muchos() abre su propia
+    # conexión, y una tabla #temporal moriría con la conexión que la creó).
+    # Confirma que ambas funciones de verdad confirman la transacción.
+    tabla = "dbo.__prueba_db_helpers__"
+    db.ejecutar(f"CREATE TABLE {tabla} (Id INT, Valor NVARCHAR(50))")
+    try:
+        db.ejecutar(f"INSERT INTO {tabla} (Id, Valor) VALUES (?, ?)", (1, "uno"))
+        db.ejecutar_muchos(f"INSERT INTO {tabla} (Id, Valor) VALUES (?, ?)", [(2, "dos"), (3, "tres")])
+
+        df = db.read_sql(f"SELECT * FROM {tabla} ORDER BY Id")
+        assert list(df["Id"]) == [1, 2, 3]
+        assert list(df["Valor"]) == ["uno", "dos", "tres"]
+    finally:
+        db.ejecutar(f"DROP TABLE {tabla}")
+
+
 def test_exec_sp_ejecuta_un_procedimiento_real_con_parametros_nombrados():
     # Verificación en vivo de exec_sp() (paso 8.2), nunca antes ejercitada
     # contra un procedimiento real: usa dbo.sp_ActualizarScoringCliente

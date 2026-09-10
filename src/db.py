@@ -60,6 +60,51 @@ def read_sql(query: str, params: tuple | dict | None = None) -> pd.DataFrame:
         return pd.read_sql(query, conn, params=params)
 
 
+def ejecutar_multi_resultset(query: str, params: tuple | None = None) -> list[pd.DataFrame]:
+    """Ejecuta una sentencia que devuelve varios *result sets* (p. ej. un
+    procedimiento almacenado con más de un SELECT, como
+    dbo.sp_ValidarEsquema o dbo.sp_ValidarCalidadDatos sin @SoloResumen)
+    y los devuelve todos como una lista de DataFrames, en el mismo orden
+    en que los emite SQL Server — pandas.read_sql() por sí solo solo
+    captura el primero."""
+    engine = get_engine()
+    resultados: list[pd.DataFrame] = []
+    with engine.connect() as conn:
+        cursor_result = conn.exec_driver_sql(query, params or ())
+        cursor = cursor_result.cursor
+        while True:
+            columnas = [c[0] for c in cursor.description]
+            filas = cursor.fetchall()
+            resultados.append(pd.DataFrame.from_records(filas, columns=columnas))
+            if not cursor.nextset():
+                break
+    return resultados
+
+
+def ejecutar(query: str, params: tuple | None = None) -> None:
+    """Ejecuta una sentencia de escritura (INSERT/UPDATE) suelta, sin
+    pasar por un procedimiento almacenado, y confirma la transacción."""
+    engine = get_engine()
+    with engine.connect() as conn:
+        conn.exec_driver_sql(query, params or ())
+        conn.commit()
+
+
+def ejecutar_muchos(query: str, filas: list[tuple]) -> None:
+    """Ejecuta la misma sentencia de escritura una vez por cada tupla de
+    `filas` (p. ej. un INSERT de una fila por tramo del baseline) dentro
+    de una única transacción. Los volúmenes aquí son de decenas de filas
+    (tramos por variable), no miles, así que un bucle simple es
+    suficiente y evita depender de detalles internos del driver."""
+    if not filas:
+        return
+    engine = get_engine()
+    with engine.connect() as conn:
+        for fila in filas:
+            conn.exec_driver_sql(query, fila)
+        conn.commit()
+
+
 def exec_sp(nombre: str, params: dict) -> None:
     """Ejecuta un procedimiento almacenado con parámetros nombrados.
 

@@ -4,7 +4,21 @@ import pandas as pd
 import pytest
 
 import main
-from src import extract, monitor, rules, score, train, writeback
+from src import calidad, drift, esquema, extract, monitor, rules, score, train, writeback
+
+
+def _veredicto_calidad_ok() -> dict:
+    return {"EjecucionId": "prueba", "Criticos": 0, "Advertencias": 0, "Conformes": 21, "Veredicto": "APTO"}
+
+
+def _aislar_controles_scorear(monkeypatch) -> None:
+    """comando_scorear ahora encadena esquema/calidad al inicio y deriva
+    al final; las pruebas que solo quieren ejercitar el armado de
+    resultados y la delegación a writeback aíslan los tres."""
+    monkeypatch.setattr(esquema, "validar_esquema", lambda: {"Criticos": 0, "Advertencias": 0})
+    monkeypatch.setattr(calidad, "validar_antes_de_entrenar", lambda: _veredicto_calidad_ok())
+    monkeypatch.setattr(train, "cargar_modelo", lambda: {"mapeo": {}, "version_modelo": "v-prueba"})
+    monkeypatch.setattr(drift, "medir_deriva", lambda *a, **k: pd.DataFrame())
 
 
 # ---------- construir_parser ----------
@@ -90,6 +104,7 @@ def _fila_cliente_prueba():
 
 
 def test_comando_scorear_arma_resultados_y_delega_en_writeback(monkeypatch):
+    _aislar_controles_scorear(monkeypatch)
     df_clientes = pd.DataFrame([_fila_cliente_prueba().drop("score")], index=pd.Index([1], name="ClienteId"))
     monkeypatch.setattr(extract, "extraer_features", lambda: df_clientes)
     monkeypatch.setattr(score, "calcular_scores", lambda df: pd.DataFrame({"score": [415.0]}, index=df.index))
@@ -125,6 +140,7 @@ def test_comando_scorear_arma_resultados_y_delega_en_writeback(monkeypatch):
 
 
 def test_comando_scorear_no_lanza_si_hay_fallidos(monkeypatch):
+    _aislar_controles_scorear(monkeypatch)
     df_clientes = pd.DataFrame([_fila_cliente_prueba().drop("score")], index=pd.Index([1], name="ClienteId"))
     monkeypatch.setattr(extract, "extraer_features", lambda: df_clientes)
     monkeypatch.setattr(score, "calcular_scores", lambda df: pd.DataFrame({"score": [415.0]}, index=df.index))
@@ -144,6 +160,109 @@ def test_comando_scorear_no_lanza_si_hay_fallidos(monkeypatch):
     resultado = main.comando_scorear(dry_run=False)  # no debe lanzar
 
     assert resultado == 1
+
+
+def test_comando_scorear_no_falla_si_la_deriva_no_se_puede_medir(monkeypatch):
+    _aislar_controles_scorear(monkeypatch)
+    monkeypatch.setattr(drift, "medir_deriva", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("sin baseline")))
+    df_clientes = pd.DataFrame([_fila_cliente_prueba().drop("score")], index=pd.Index([1], name="ClienteId"))
+    monkeypatch.setattr(extract, "extraer_features", lambda: df_clientes)
+    monkeypatch.setattr(score, "calcular_scores", lambda df: pd.DataFrame({"score": [415.0]}, index=df.index))
+    monkeypatch.setattr(rules, "asignar_segmento", lambda s: 3)
+    monkeypatch.setattr(rules, "aplicar_overrides", lambda cliente, seg_id: "ALTO")
+    monkeypatch.setattr(rules, "resolver_segmento_final", lambda seg_id, codigo: 3)
+    monkeypatch.setattr(rules, "recomendar_plazo", lambda codigo: 2)
+    monkeypatch.setattr(rules, "clasificar_cliente", lambda cliente: "B")
+    monkeypatch.setattr(rules, "resolver_clasificacion_id", lambda codigo: 2)
+    monkeypatch.setattr(rules, "marcar_revision", lambda cliente, codigo: False)
+    monkeypatch.setattr(
+        writeback, "guardar_resultados", lambda df, dry_run=False, **k: {"modo": "real", "total": 1, "cambiaron_segmento": [], "sin_cambios": [], "fallidos": []}
+    )
+
+    resultado = main.comando_scorear(dry_run=False)  # no debe lanzar aunque la deriva falle
+
+    assert resultado == 1
+
+
+def test_comando_scorear_no_llega_a_scorear_si_el_esquema_tiene_criticos(monkeypatch):
+    llamadas = []
+    monkeypatch.setattr(
+        esquema, "validar_esquema", lambda: (_ for _ in ()).throw(esquema.EsquemaInvalidoError("1 hallazgo(s) crítico(s)."))
+    )
+    monkeypatch.setattr(extract, "extraer_features", lambda: llamadas.append(1))
+
+    with pytest.raises(esquema.EsquemaInvalidoError):
+        main.comando_scorear(dry_run=True)
+
+    assert llamadas == []
+
+
+def test_comando_scorear_no_llega_a_scorear_si_la_calidad_tiene_criticos(monkeypatch):
+    llamadas = []
+    monkeypatch.setattr(esquema, "validar_esquema", lambda: {"Criticos": 0, "Advertencias": 0})
+    monkeypatch.setattr(
+        calidad, "validar_antes_de_entrenar", lambda: (_ for _ in ()).throw(calidad.CalidadDatosError("NO APTO"))
+    )
+    monkeypatch.setattr(extract, "extraer_features", lambda: llamadas.append(1))
+
+    with pytest.raises(calidad.CalidadDatosError):
+        main.comando_scorear(dry_run=True)
+
+    assert llamadas == []
+
+
+# ---------- comando_validar_esquema / comando_validar_calidad / comando_medir_deriva ----------
+
+
+def test_parser_validar_esquema():
+    assert main.construir_parser().parse_args(["validar-esquema"]).comando == "validar-esquema"
+
+
+def test_parser_validar_calidad():
+    assert main.construir_parser().parse_args(["validar-calidad"]).comando == "validar-calidad"
+
+
+def test_parser_medir_deriva():
+    assert main.construir_parser().parse_args(["medir-deriva"]).comando == "medir-deriva"
+
+
+def test_comando_validar_esquema_devuelve_criticos_mas_advertencias(monkeypatch):
+    monkeypatch.setattr(esquema, "validar_esquema", lambda: {"Criticos": 1, "Advertencias": 2})
+    assert main.comando_validar_esquema() == 3
+
+
+def test_comando_validar_calidad_devuelve_el_total_de_hallazgos(monkeypatch):
+    monkeypatch.setattr(calidad, "validar_antes_de_entrenar", lambda: {"Criticos": 0, "Advertencias": 1, "Conformes": 20})
+    assert main.comando_validar_calidad() == 21
+
+
+def test_comando_medir_deriva_usa_la_version_del_modelo_vigente(monkeypatch):
+    llamadas = {}
+    monkeypatch.setattr(train, "cargar_modelo", lambda: {"mapeo": {"VarA": {}}, "version_modelo": "v-1"})
+
+    def _medir_falso(version_modelo, mapeo):
+        llamadas["version"] = version_modelo
+        return pd.DataFrame({"Variable": ["VarA"], "PSI": [0.1]})
+
+    monkeypatch.setattr(drift, "medir_deriva", _medir_falso)
+
+    assert main.comando_medir_deriva() == 1
+    assert llamadas["version"] == "v-1"
+
+
+def test_comando_medir_deriva_usa_fecha_entrenamiento_si_no_hay_version_modelo(monkeypatch):
+    # Compatibilidad con modelos guardados antes de que existiera esta clave.
+    llamadas = {}
+    monkeypatch.setattr(train, "cargar_modelo", lambda: {"mapeo": {}, "fecha_entrenamiento": "2026-01-01T00:00:00"})
+
+    def _medir_falso(version_modelo, mapeo):
+        llamadas["version"] = version_modelo
+        return pd.DataFrame()
+
+    monkeypatch.setattr(drift, "medir_deriva", _medir_falso)
+
+    main.comando_medir_deriva()
+    assert llamadas["version"] == "2026-01-01T00:00:00"
 
 
 # ---------- comando_monitorear ----------
@@ -185,4 +304,23 @@ def test_main_scorear_dry_run_pipeline_completo_contra_datos_reales():
 
 def test_main_monitorear_no_falla_con_datos_reales():
     codigo = main.main(["monitorear"])
+    assert codigo == 0
+
+
+def test_main_validar_esquema_contra_datos_reales():
+    # No se asume el estado del esquema real: ambos desenlaces (0 o
+    # exit 1 con hallazgos críticos) son un resultado válido de la CLI.
+    codigo = main.main(["validar-esquema"])
+    assert codigo in (0, 1)
+
+
+def test_main_validar_calidad_contra_datos_reales():
+    codigo = main.main(["validar-calidad"])
+    assert codigo in (0, 1)
+
+
+def test_main_medir_deriva_contra_el_modelo_vigente():
+    # Requiere que exista un baseline registrado para el modelo guardado
+    # en models/modelo.pkl (train.entrenar() ya lo registra al terminar).
+    codigo = main.main(["medir-deriva"])
     assert codigo == 0

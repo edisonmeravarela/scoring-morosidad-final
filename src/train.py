@@ -25,7 +25,10 @@ from scipy.stats import ks_2samp
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 
+from src.calidad import validar_antes_de_entrenar
 from src.config import RAIZ_PROYECTO, cargar_config
+from src.drift import registrar_baseline
+from src.esquema import validar_esquema
 from src.extract import excluir_sin_historial, extraer_dataset_entrenamiento
 from src.features import preparar_features, transformar_a_woe
 
@@ -197,15 +200,19 @@ def _resolver_ruta(clave: str, valor_por_defecto: str, ruta_override=None) -> Pa
     return ruta if ruta.is_absolute() else RAIZ_PROYECTO / ruta
 
 
-def guardar_modelo(resultado: dict, ruta_modelo=None) -> Path:
+def guardar_modelo(resultado: dict, ruta_modelo=None, marca_tiempo: str | None = None) -> Path:
     """Serializa el modelo con joblib, versionado con la fecha de
     entrenamiento, y además lo guarda/sobrescribe en la ruta estable
     (models/modelo.pkl) que usará src/score.py — solo se llega aquí si el
-    modelo ya pasó los criterios de aceptación."""
+    modelo ya pasó los criterios de aceptación.
+
+    `marca_tiempo`, si se indica, es la misma etiqueta de versión que
+    entrenar() usa para dbo.BaselineVariable (src/drift.py) — el
+    artefacto serializado y el baseline deben compartirla."""
     ruta_estable = _resolver_ruta("ruta_modelo", "models/modelo.pkl", ruta_modelo)
     ruta_estable.parent.mkdir(exist_ok=True, parents=True)
 
-    marca_tiempo = datetime.now().strftime("%Y%m%d_%H%M%S")
+    marca_tiempo = marca_tiempo or datetime.now().strftime("%Y%m%d_%H%M%S")
     ruta_versionada = ruta_estable.parent / f"{ruta_estable.stem}_{marca_tiempo}{ruta_estable.suffix}"
 
     joblib.dump(resultado, ruta_versionada)
@@ -226,7 +233,19 @@ def entrenar() -> dict:
     """Orquesta el paso 8.5 completo. Devuelve el dict con el modelo, el
     mapeo WOE, las columnas del modelo y las métricas de validación.
     Lanza ModeloRechazadoError sin escribir nada en models/ si el modelo
-    no cumple los criterios de aceptación (KS mínimo, techo de AUC)."""
+    no cumple los criterios de aceptación (KS mínimo, techo de AUC).
+
+    Antes de extraer nada, corre los dos primeros controles del
+    documento "Controles de Esquema, Calidad y Deriva de Datos", en su
+    orden de dependencia obligatorio: 1) esquema (src.esquema.validar_esquema,
+    SIEMPRE bloquea ante un hallazgo crítico — no tiene sentido validar
+    reglas de negocio sobre una estructura que cambió) y 2) calidad
+    (src.calidad.validar_antes_de_entrenar, bloquea solo ante críticos).
+    Cualquiera de los dos puede lanzar antes de tocar los datos de
+    entrenamiento."""
+    validar_esquema()
+    validar_antes_de_entrenar()
+
     config = _config_entrenamiento()
     target_col = config.get("columna_target", "Target")
 
@@ -292,14 +311,24 @@ def entrenar() -> dict:
     scorecard.to_csv(ruta_scorecard, index=False, encoding="utf-8")
     logger.info("Scorecard exportado a %s (%d filas).", ruta_scorecard, len(scorecard))
 
+    marca_tiempo = datetime.now().strftime("%Y%m%d_%H%M%S")
     resultado = {
         "modelo": modelo,
         "mapeo": mapeo,
         "columnas": list(x_train.columns),
         "metricas": {"auc": auc, "ks": ks},
         "fecha_entrenamiento": datetime.now().isoformat(),
+        "version_modelo": marca_tiempo,
         "n_entrenamiento": len(train_df),
         "n_validacion": len(val_df),
     }
-    guardar_modelo(resultado)
+    guardar_modelo(resultado, marca_tiempo=marca_tiempo)
+
+    try:
+        registrar_baseline(marca_tiempo, datetime.now().date(), train_df, mapeo)
+    except Exception as exc:
+        # El modelo ya quedó guardado y es válido; perder el baseline
+        # degrada la medición de deriva pero no invalida el entrenamiento.
+        logger.error("No se pudo registrar el baseline de deriva para la versión %s: %s", marca_tiempo, exc)
+
     return resultado
