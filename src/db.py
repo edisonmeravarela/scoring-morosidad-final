@@ -78,6 +78,12 @@ def ejecutar_multi_resultset(query: str, params: tuple | None = None) -> list[pd
             resultados.append(pd.DataFrame.from_records(filas, columns=columnas))
             if not cursor.nextset():
                 break
+        # Necesario incluso para procedimientos de solo lectura como
+        # sp_ValidarEsquema (confirmar una transacción de solo lectura no
+        # tiene efecto): sin este commit, un procedimiento que además
+        # inserta (p. ej. sp_RegistrarEvaluacion) perdería la escritura al
+        # cerrarse la conexión sin confirmar.
+        conn.commit()
     return resultados
 
 

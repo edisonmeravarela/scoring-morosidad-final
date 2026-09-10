@@ -20,6 +20,15 @@ def _aislar_controles_previos(monkeypatch) -> None:
     monkeypatch.setattr(train, "validar_esquema", lambda: _veredicto_esquema_ok())
     monkeypatch.setattr(train, "validar_antes_de_entrenar", lambda: _veredicto_calidad_ok())
     monkeypatch.setattr(train, "registrar_baseline", lambda *a, **k: {"filas_categoricas": 0, "filas_numericas": 0})
+    monkeypatch.setattr(
+        train,
+        "evaluar_modelo",
+        lambda **k: {
+            "ks": 0.0, "auc": 0.0, "umbral_operativo": 0,
+            "conteos_validacion": {"VP": 0, "FP": 0, "FN": 0, "VN": 0},
+            "validacion_cruzada": None, "EvaluacionId": 1, "Aceptado": True, "MotivoRechazo": None,
+        },
+    )
 
 
 def _dataset_entrenamiento_sintetico(seed: int = 7) -> pd.DataFrame:

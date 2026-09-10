@@ -29,6 +29,7 @@ from src.calidad import validar_antes_de_entrenar
 from src.config import RAIZ_PROYECTO, cargar_config
 from src.drift import registrar_baseline
 from src.esquema import validar_esquema
+from src.evaluacion import evaluar_modelo
 from src.extract import excluir_sin_historial, extraer_dataset_entrenamiento
 from src.features import preparar_features, transformar_a_woe
 
@@ -283,6 +284,43 @@ def entrenar() -> dict:
         auc_maximo,
     )
 
+    # Etiqueta de versión calculada ya aquí (y no más abajo, tras el
+    # criterio de aceptación) porque el módulo de evaluación (sección 8
+    # del documento "Métricas de evaluación del modelo") registra la
+    # evaluación de AMBOS desenlaces, aceptado o rechazado — el propio
+    # dbo.sp_RegistrarEvaluacion deja constancia del motivo de rechazo,
+    # es la bitácora de evaluaciones, no solo de modelos aceptados.
+    marca_tiempo = datetime.now().strftime("%Y%m%d_%H%M%S")
+    factor, offset = factor_offset()
+    score_config = cargar_config().get("score", {})
+    score_min = score_config.get("score_min", 0)
+    score_max = score_config.get("score_max", 1000)
+    cliente_col = config.get("columna_cliente", "ClienteId")
+
+    try:
+        evaluar_modelo(
+            version_modelo=marca_tiempo,
+            alternativa="REGRESION_LOGISTICA_WOE",
+            es_modelo_servido=True,
+            modelo=modelo,
+            x_val=x_val,
+            y_val=y_val,
+            df_cv=df,
+            target_col=target_col,
+            cliente_col=cliente_col,
+            n_entrenamiento=len(train_df),
+            entrenador_cv=entrenar_regresion_logistica,
+            factor=factor,
+            offset=offset,
+            score_min=score_min,
+            score_max=score_max,
+        )
+    except Exception as exc:
+        # La evaluación es un registro de auditoría adicional; un fallo
+        # aquí no debe impedir que el modelo se acepte o se rechace por
+        # sus propios criterios (ks_minimo/auc_maximo), calculados aparte.
+        logger.error("No se pudo registrar la evaluación de REGRESION_LOGISTICA_WOE para la versión %s: %s", marca_tiempo, exc)
+
     if config.get("entrenar_xgboost", True):
         try:
             modelo_xgb = entrenar_xgboost(x_train, y_train)
@@ -290,6 +328,26 @@ def entrenar() -> dict:
             auc_xgb = float(roc_auc_score(y_val, proba_xgb))
             ks_xgb = calcular_ks(y_val, proba_xgb)
             logger.info("Validación (XGBoost, solo comparación): AUC=%.4f, KS=%.4f.", auc_xgb, ks_xgb)
+            try:
+                evaluar_modelo(
+                    version_modelo=marca_tiempo,
+                    alternativa="XGBOOST",
+                    es_modelo_servido=False,
+                    modelo=modelo_xgb,
+                    x_val=x_val,
+                    y_val=y_val,
+                    df_cv=df,
+                    target_col=target_col,
+                    cliente_col=cliente_col,
+                    n_entrenamiento=len(train_df),
+                    entrenador_cv=entrenar_xgboost,
+                    factor=factor,
+                    offset=offset,
+                    score_min=score_min,
+                    score_max=score_max,
+                )
+            except Exception as exc:
+                logger.error("No se pudo registrar la evaluación de XGBOOST para la versión %s: %s", marca_tiempo, exc)
         except DatosInsuficientesError:
             pass
 
@@ -311,7 +369,6 @@ def entrenar() -> dict:
     scorecard.to_csv(ruta_scorecard, index=False, encoding="utf-8")
     logger.info("Scorecard exportado a %s (%d filas).", ruta_scorecard, len(scorecard))
 
-    marca_tiempo = datetime.now().strftime("%Y%m%d_%H%M%S")
     resultado = {
         "modelo": modelo,
         "mapeo": mapeo,
