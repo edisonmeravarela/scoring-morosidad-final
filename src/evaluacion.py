@@ -24,14 +24,13 @@ Se apoya en objetos ya construidos en la base de datos:
     `dbo.vw_DeclaradoVsObservado`: lectura, expuestas también en el menú
     "Métricas de evaluación del modelo" de GestionCartera.
 
-Hallazgo (no corregido en este módulo, documentado en el manual técnico):
-el corte declarado en `dbo.CorteSegmento` (ALTO/CRITICO hasta score=499)
-no coincide exactamente con `config.reglas.cortes_score` (hasta 500), que
-sigue siendo la fuente real que usa `rules.py` para asignar el segmento a
-cada cliente — un desalineamiento de 1 punto en cada límite de banda. Este
-módulo usa la tabla de la base como corte operativo del *cálculo de
-métricas*, tal como exige el documento ("fuente única del corte
-operativo"), sin modificar `rules.py`.
+Hallazgo corregido: el corte declarado en `dbo.CorteSegmento`
+(ALTO/CRITICO hasta score=499) estaba desalineado en 1 punto respecto a
+`config.reglas.cortes_score` (hasta 500), la fuente real que usa
+`rules.py` para asignar el segmento a cada cliente. Se corrigió
+`dbo.CorteSegmento` (ALTO ahora hasta 500, MEDIO desde 501) para que
+`dbo.fn_UmbralOperativo()` devuelva 500, igual que `rules.py` — sin tocar
+`rules.py` ni `config.yaml`, que ya tenían el valor correcto.
 """
 
 import logging
@@ -65,9 +64,8 @@ class EvaluacionInsuficienteError(Exception):
 
 def obtener_umbral_operativo() -> int:
     """dbo.fn_UmbralOperativo(): el score más alto que aún restringe
-    crédito, según dbo.CorteSegmento — ver el hallazgo documentado en el
-    docstring del módulo sobre su desalineamiento de 1 punto contra
-    config.reglas.cortes_score."""
+    crédito, según dbo.CorteSegmento — alineado con config.reglas.cortes_score
+    (ver el hallazgo corregido en el docstring del módulo)."""
     return int(read_sql("SELECT dbo.fn_UmbralOperativo() AS umbral").iloc[0]["umbral"])
 
 
