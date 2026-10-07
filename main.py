@@ -8,6 +8,7 @@ documento "Controles de Esquema, Calidad y Deriva de Datos").
     python main.py entrenar              # Encadena esquema, calidad y entrenamiento
     python main.py scorear --dry-run     # Encadena esquema, calidad, scoring y deriva, en simulación
     python main.py scorear               # Ídem, ejecución real con escritura en base de datos
+    python main.py scorear --clientes 101,205   # Ídem, acotado a esos ClienteId (reevaluación bajo demanda)
     python main.py monitorear            # Desempeño en producción y desviación de datos (paso 8.9)
 
 Cada subcomando corre envuelto en _ejecutar_con_bitacora(), que registra
@@ -149,18 +150,39 @@ def _construir_resultados_scoring(df_clientes: pd.DataFrame) -> tuple[pd.DataFra
     return pd.DataFrame(filas), clientes_en_revision
 
 
-def comando_scorear(dry_run: bool) -> int:
+def comando_scorear(dry_run: bool, clientes_ids: list[int] | None = None) -> int:
     """Pasos 2, 3, 5, 6 y 7: extraer_features (inferencia) + calcular_scores
     + reglas de negocio + guardar_resultados (real o en simulación).
 
     Encadena, en orden: esquema (siempre bloquea) → calidad (bloquea
     ante críticos) → scoring/reglas/escritura → deriva (nunca bloquea,
     se mide al final contra el baseline del modelo vigente; un fallo al
-    medirla no invalida un scoring ya escrito)."""
+    medirla no invalida un scoring ya escrito).
+
+    `clientes_ids`, si se pasa, acota el scoring a esos ClienteId (uso:
+    reevaluación bajo demanda de la cola dbo.ColaRescoreo, en vez del
+    scoring mensual de toda la cartera). El filtro se aplica DESPUÉS de
+    extraer_features() — nunca sobre la consulta SQL de la vista — para
+    que extract.py siga validando el mínimo de clientes configurado
+    (config.extract.minimo_clientes) contra la población completa, no
+    contra el subconjunto.
+
+    extract.agregar_historial_evaluable() incorpora TieneHistorial (y
+    FacturasResueltas/UmbralVigente) a cada cliente antes de llamar a las
+    reglas de negocio: src/rules.py ya no cuenta NumFacturas por su
+    cuenta para decidir el override NUEVO/la clasificación RFM, consulta
+    el mismo criterio que usan el entrenamiento y la cola de
+    reevaluación (dbo.vw_HistorialClienteActual)."""
     esquema.validar_esquema()
     calidad.validar_antes_de_entrenar()
 
     df_clientes = extract.extraer_features()
+    df_clientes = extract.agregar_historial_evaluable(df_clientes)
+    if clientes_ids is not None:
+        df_clientes = df_clientes.loc[df_clientes.index.isin(clientes_ids)]
+        if df_clientes.empty:
+            logger.info("Reevaluación bajo demanda: ninguno de los %d ClienteId pedidos es evaluable ahora mismo.", len(clientes_ids))
+            return 0
     scores = score.calcular_scores(df_clientes)
     combinado = df_clientes.join(scores)
 
@@ -239,6 +261,12 @@ def construir_parser() -> argparse.ArgumentParser:
         "scorear", help="Calcula scores, aplica reglas de negocio y escribe en base de datos (pasos 2, 3, 5, 6 y 7)."
     )
     parser_scorear.add_argument("--dry-run", action="store_true", help="Simula sin escribir en base de datos.")
+    parser_scorear.add_argument(
+        "--clientes",
+        type=str,
+        default=None,
+        help="Lista de ClienteId separados por coma; acota el scoring a esos clientes en vez de toda la cartera (reevaluación bajo demanda).",
+    )
 
     subparsers.add_parser("monitorear", help="Evalúa el desempeño en producción y detecta desviación de datos (paso 8).")
 
@@ -258,8 +286,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.comando == "entrenar":
         return _ejecutar_con_bitacora("entrenar", comando_entrenar)
     if args.comando == "scorear":
+        clientes_ids = [int(x) for x in args.clientes.split(",")] if args.clientes else None
         nombre = "scorear --dry-run" if args.dry_run else "scorear"
-        return _ejecutar_con_bitacora(nombre, lambda: comando_scorear(args.dry_run))
+        if clientes_ids is not None:
+            nombre += f" --clientes ({len(clientes_ids)})"
+        return _ejecutar_con_bitacora(nombre, lambda: comando_scorear(args.dry_run, clientes_ids))
     if args.comando == "monitorear":
         return _ejecutar_con_bitacora("monitorear", comando_monitorear)
 

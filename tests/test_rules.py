@@ -34,7 +34,6 @@ def _config_reglas_prueba(**overrides) -> dict:
             {"hasta": None, "segmento": "BAJO"},
         ],
         "dias_mora_critico": 90,
-        "minimo_facturas_para_evaluar": 3,
         "plazo_por_segmento": {
             "BAJO": "60 DÍAS",
             "MEDIO": "30 DÍAS",
@@ -87,32 +86,44 @@ def test_asignar_segmento_cortes_exactos(score, segmento_id_esperado):
 
 
 def test_aplicar_overrides_sin_condiciones_mantiene_el_segmento():
-    cliente = {"DiasMoraMaxima": 48, "NumFacturas": 7}
+    cliente = {"DiasMoraMaxima": 48, "TieneHistorial": True}
     assert rules.aplicar_overrides(cliente, segmento_id=3) == "ALTO"  # ejemplo del documento
 
 
 def test_aplicar_overrides_mora_en_el_limite_no_fuerza_critico():
-    cliente = {"DiasMoraMaxima": 90, "NumFacturas": 7}
+    cliente = {"DiasMoraMaxima": 90, "TieneHistorial": True}
     assert rules.aplicar_overrides(cliente, segmento_id=2) == "MEDIO"
 
 
 def test_aplicar_overrides_mora_supera_el_limite_fuerza_critico():
-    cliente = {"DiasMoraMaxima": 91, "NumFacturas": 7}
+    cliente = {"DiasMoraMaxima": 91, "TieneHistorial": True}
     assert rules.aplicar_overrides(cliente, segmento_id=1) == "CRITICO"
 
 
-def test_aplicar_overrides_facturas_en_el_minimo_no_fuerza_nuevo():
-    cliente = {"DiasMoraMaxima": 0, "NumFacturas": 3}
+def test_aplicar_overrides_con_historial_suficiente_no_fuerza_nuevo():
+    # TieneHistorial ya viene calculado por dbo.fn_HistorialCliente
+    # (vía extract.agregar_historial_evaluable) con el umbral exacto de
+    # dbo.ParametroScoring.MIN_FACTURAS_HISTORIAL — aplicar_overrides ya
+    # no vuelve a comparar un conteo propio de facturas.
+    cliente = {"DiasMoraMaxima": 0, "TieneHistorial": True, "FacturasResueltas": 3, "UmbralVigente": 3}
     assert rules.aplicar_overrides(cliente, segmento_id=1) == "BAJO"
 
 
-def test_aplicar_overrides_menos_del_minimo_de_facturas_fuerza_nuevo():
-    cliente = {"DiasMoraMaxima": 0, "NumFacturas": 2}
+def test_aplicar_overrides_sin_historial_fuerza_nuevo():
+    cliente = {"DiasMoraMaxima": 0, "TieneHistorial": False, "FacturasResueltas": 2, "UmbralVigente": 3}
+    assert rules.aplicar_overrides(cliente, segmento_id=1) == rules.NUEVO
+
+
+def test_aplicar_overrides_sin_la_clave_tienehistorial_fuerza_nuevo_por_defecto():
+    # Igual que antes (NumFacturas ausente -> 0 -> NUEVO): si falta el
+    # dato, el comportamiento seguro es tratar al cliente como sin
+    # historial, no asumir que sí lo tiene.
+    cliente = {"DiasMoraMaxima": 0}
     assert rules.aplicar_overrides(cliente, segmento_id=1) == rules.NUEVO
 
 
 def test_aplicar_overrides_mora_tiene_prioridad_sobre_sin_historial():
-    cliente = {"DiasMoraMaxima": 91, "NumFacturas": 1}
+    cliente = {"DiasMoraMaxima": 91, "TieneHistorial": False}
     assert rules.aplicar_overrides(cliente, segmento_id=1) == "CRITICO"
 
 
@@ -136,29 +147,34 @@ def test_recomendar_plazo_segmento_desconocido_lanza_error():
 
 
 def test_clasificar_cliente_sin_historial_es_nuevo():
-    cliente = {"NumFacturas": 2, "DiasDesdeUltimaFactura": 1, "ValorFacturaPromedio": 5000}
+    cliente = {"TieneHistorial": False, "NumFacturas": 2, "DiasDesdeUltimaFactura": 1, "ValorFacturaPromedio": 5000}
+    assert rules.clasificar_cliente(cliente) == rules.NUEVO
+
+
+def test_clasificar_cliente_sin_la_clave_tienehistorial_es_nuevo_por_defecto():
+    cliente = {"NumFacturas": 12, "DiasDesdeUltimaFactura": 10, "ValorFacturaPromedio": 3000}
     assert rules.clasificar_cliente(cliente) == rules.NUEVO
 
 
 def test_clasificar_cliente_rfm_alto_es_a():
-    cliente = {"NumFacturas": 12, "DiasDesdeUltimaFactura": 10, "ValorFacturaPromedio": 3000}
+    cliente = {"TieneHistorial": True, "NumFacturas": 12, "DiasDesdeUltimaFactura": 10, "ValorFacturaPromedio": 3000}
     assert rules.clasificar_cliente(cliente) == "A"
 
 
 def test_clasificar_cliente_rfm_medio_es_b():
     # Recencia regular (2) + frecuencia regular (2) + monto regular (2) = 6 -> B.
     # Mismo caso que el ejemplo del documento (7 facturas, monto medio) -> "B".
-    cliente = {"NumFacturas": 7, "DiasDesdeUltimaFactura": 60, "ValorFacturaPromedio": 1000}
+    cliente = {"TieneHistorial": True, "NumFacturas": 7, "DiasDesdeUltimaFactura": 60, "ValorFacturaPromedio": 1000}
     assert rules.clasificar_cliente(cliente) == "B"
 
 
 def test_clasificar_cliente_rfm_bajo_es_c():
-    cliente = {"NumFacturas": 4, "DiasDesdeUltimaFactura": 200, "ValorFacturaPromedio": 100}
+    cliente = {"TieneHistorial": True, "NumFacturas": 4, "DiasDesdeUltimaFactura": 200, "ValorFacturaPromedio": 100}
     assert rules.clasificar_cliente(cliente) == "C"
 
 
 def test_clasificar_cliente_recencia_ausente_no_falla():
-    cliente = {"NumFacturas": 5, "ValorFacturaPromedio": 1000}
+    cliente = {"TieneHistorial": True, "NumFacturas": 5, "ValorFacturaPromedio": 1000}
     assert rules.clasificar_cliente(cliente) in {"A", "B", "C"}
 
 
@@ -225,6 +241,7 @@ def test_flujo_completo_reproduce_ejemplo_del_documento_contra_catalogos_reales(
 
     cliente = {
         "DiasMoraMaxima": 48,
+        "TieneHistorial": True,
         "NumFacturas": 7,
         "SaldoActualTotal": 1430,
         "DiasDesdeUltimaFactura": 60,

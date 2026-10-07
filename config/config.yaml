@@ -161,9 +161,13 @@ reglas:
   # BAJO/MEDIO/ALTO/CRITICO): es un marcador interno de "sin historial
   # suficiente para evaluar riesgo" que solo usan recomendar_plazo (para
   # forzar CONTADO) y clasificar_cliente (que ya lo devuelve por defecto
-  # en este caso, sección 7).
+  # en este caso, sección 7). El umbral de historial (antes
+  # minimo_facturas_para_evaluar, aquí) ya no vive en este archivo: se
+  # unificó en dbo.ParametroScoring.MIN_FACTURAS_HISTORIAL, consultado
+  # en vivo vía dbo.vw_HistorialClienteActual (src/rules.py lee
+  # `TieneHistorial`, no un umbral propio) — mismo criterio que usan el
+  # entrenamiento y la cola de reevaluación bajo demanda.
   dias_mora_critico: 90
-  minimo_facturas_para_evaluar: 3
 
   # 7. Plazo de pago recomendado por segmento (Nombre de dbo.PlazoPago).
   # El documento describe BAJO como "60 a 90 días" (un rango); el

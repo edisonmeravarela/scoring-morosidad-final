@@ -9,11 +9,13 @@ decisión, sin caja negra.
 Los umbrales que YA viven en la base de datos (LimiteCredito y
 DiasMaxMora por segmento en dbo.SegmentoRiesgo, Dias por plazo en
 dbo.PlazoPago — sección 3.1: "modificar la política es un UPDATE en base
-de datos, no un cambio de código") se consultan en vivo contra esas
-tablas, no se duplican en config.yaml. Los umbrales que este módulo
-introduce y que ningún catálogo contiene (cortes de score, condiciones
-de anulación, clasificación RFM, mapeo segmento -> nombre de plazo) sí
-se leen de config.yaml, nunca fijos en el código (criterio de 8.7).
+de datos, no un cambio de código"; y, desde la unificación del criterio
+de historial evaluable, también dbo.ParametroScoring.MIN_FACTURAS_HISTORIAL)
+se consultan en vivo contra esas tablas, no se duplican en config.yaml.
+Los umbrales que este módulo introduce y que ningún catálogo contiene
+(cortes de score, mora crítica, clasificación RFM, mapeo segmento ->
+nombre de plazo) sí se leen de config.yaml, nunca fijos en el código
+(criterio de 8.7).
 
 Dos tipos de "segmento" conviven a propósito en este módulo:
   - SegmentoRiesgoId: el id real de dbo.SegmentoRiesgo. Es lo único que
@@ -22,11 +24,14 @@ Dos tipos de "segmento" conviven a propósito en este módulo:
   - Codigo (BAJO/MEDIO/ALTO/CRITICO/NUEVO): el resultado de
     aplicar_overrides() en adelante. "NUEVO" no es una fila de
     dbo.SegmentoRiesgo — es un marcador interno para "sin historial
-    suficiente para evaluar riesgo" (documento, sección 3.2, "menos de
-    tres facturas fuerza NUEVO con plazo contado"); solo lo consumen
-    recomendar_plazo() (fuerza CONTADO) y, de forma independiente,
-    clasificar_cliente() (que ya llega a NUEVO por su propio criterio de
-    historial insuficiente, sección 7).
+    suficiente para evaluar riesgo" (documento, sección 3.2), derivado
+    de `TieneHistorial` (dbo.vw_HistorialClienteActual, incorporado por
+    extract.agregar_historial_evaluable() antes de llamar a este
+    módulo — mismo criterio que usan el entrenamiento y la cola de
+    reevaluación bajo demanda, nunca un conteo propio de NumFacturas);
+    solo lo consumen recomendar_plazo() (fuerza CONTADO) y, de forma
+    independiente, clasificar_cliente() (que llega a NUEVO por el mismo
+    `TieneHistorial`, sección 7).
 """
 
 import logging
@@ -134,17 +139,27 @@ def aplicar_overrides(cliente: pd.Series | dict, segmento_id: int) -> str:
     en el catálogo."""
     config = _config_reglas()
     dias_mora_critico = config.get("dias_mora_critico", 90)
-    minimo_facturas = config.get("minimo_facturas_para_evaluar", 3)
 
     mora_maxima = cliente.get("DiasMoraMaxima", 0) or 0
-    num_facturas = cliente.get("NumFacturas", 0) or 0
 
     if mora_maxima > dias_mora_critico:
         logger.info("Override CRITICO: mora máxima %.0f días > %d.", mora_maxima, dias_mora_critico)
         return "CRITICO"
 
-    if num_facturas < minimo_facturas:
-        logger.info("Override NUEVO: %d facturas < mínimo %d para evaluar riesgo.", num_facturas, minimo_facturas)
+    # Criterio único de "historial evaluable" (dbo.ParametroScoring vía
+    # dbo.vw_HistorialClienteActual/dbo.fn_HistorialCliente, incorporado
+    # por extract.agregar_historial_evaluable antes de llegar aquí) — el
+    # mismo que usan vw_DatasetEntrenamientoFactura y la cola de
+    # reevaluación. Ya NO se cuenta NumFacturas con un umbral propio
+    # (config.reglas.minimo_facturas_para_evaluar, retirado): esa cuenta
+    # no exigía que el vencimiento ya hubiera transcurrido, y podía (y
+    # llegó a) divergir de los otros dos consumidores del criterio.
+    if not cliente.get("TieneHistorial"):
+        logger.info(
+            "Override NUEVO: historial insuficiente (%s/%s facturas con vencimiento transcurrido).",
+            cliente.get("FacturasResueltas"),
+            cliente.get("UmbralVigente"),
+        )
         return NUEVO
 
     catalogo = _catalogo_segmentos()
@@ -168,14 +183,14 @@ def clasificar_cliente(cliente: pd.Series | dict) -> str:
     """Paso 4 (sección 3.2/7): clasificación comercial A/B/C/NUEVO por
     RFM (Recencia, Frecuencia, Monto), independiente del riesgo. Sin
     historial suficiente, el cliente queda en NUEVO por defecto (sección
-    7), con el mismo umbral de minimo_facturas_para_evaluar que usa el
-    override de riesgo."""
+    7), con el mismo criterio de TieneHistorial que usa el override de
+    riesgo (aplicar_overrides) — ver nota ahí sobre el retiro de
+    minimo_facturas_para_evaluar."""
     config = _config_reglas()
-    minimo_facturas = config.get("minimo_facturas_para_evaluar", 3)
-    num_facturas = cliente.get("NumFacturas", 0) or 0
-    if num_facturas < minimo_facturas:
+    if not cliente.get("TieneHistorial"):
         return NUEVO
 
+    num_facturas = cliente.get("NumFacturas", 0) or 0
     rfm = config.get("rfm", {})
     recencia_dias = cliente.get("DiasDesdeUltimaFactura", None)
     monto = cliente.get("ValorFacturaPromedio", 0) or 0

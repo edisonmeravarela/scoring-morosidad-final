@@ -14,11 +14,16 @@ def _veredicto_calidad_ok() -> dict:
 def _aislar_controles_scorear(monkeypatch) -> None:
     """comando_scorear ahora encadena esquema/calidad al inicio y deriva
     al final; las pruebas que solo quieren ejercitar el armado de
-    resultados y la delegación a writeback aíslan los tres."""
+    resultados y la delegación a writeback aíslan los tres. También aísla
+    extract.agregar_historial_evaluable (de lo contrario haría una
+    consulta real contra dbo.vw_HistorialClienteActual incluso en estas
+    pruebas unitarias, que no necesitan ese dato porque además mockean
+    rules.aplicar_overrides/clasificar_cliente directamente)."""
     monkeypatch.setattr(esquema, "validar_esquema", lambda: {"Criticos": 0, "Advertencias": 0})
     monkeypatch.setattr(calidad, "validar_antes_de_entrenar", lambda: _veredicto_calidad_ok())
     monkeypatch.setattr(train, "cargar_modelo", lambda: {"mapeo": {}, "version_modelo": "v-prueba"})
     monkeypatch.setattr(drift, "medir_deriva", lambda *a, **k: pd.DataFrame())
+    monkeypatch.setattr(extract, "agregar_historial_evaluable", lambda df: df)
 
 
 # ---------- construir_parser ----------
@@ -38,6 +43,16 @@ def test_parser_scorear_sin_dry_run():
 def test_parser_scorear_con_dry_run():
     args = main.construir_parser().parse_args(["scorear", "--dry-run"])
     assert args.dry_run is True
+
+
+def test_parser_scorear_con_clientes():
+    args = main.construir_parser().parse_args(["scorear", "--clientes", "101,205,330"])
+    assert args.clientes == "101,205,330"
+
+
+def test_parser_scorear_sin_clientes_por_defecto():
+    args = main.construir_parser().parse_args(["scorear"])
+    assert args.clientes is None
 
 
 def test_parser_monitorear():
@@ -137,6 +152,82 @@ def test_comando_scorear_arma_resultados_y_delega_en_writeback(monkeypatch):
     assert fila["ClasificacionId"] == 2
     assert fila["PlazoPagoRecomendadoId"] == 2
     assert "ALTO" in fila["Motivo"]
+
+
+def test_comando_scorear_incorpora_el_historial_evaluable_antes_de_las_reglas(monkeypatch):
+    """Confirma que comando_scorear llama a
+    extract.agregar_historial_evaluable (criterio único de "historial
+    evaluable" compartido con el entrenamiento y la cola de reevaluación
+    — src/rules.py ya no cuenta NumFacturas por su cuenta)."""
+    _aislar_controles_scorear(monkeypatch)
+    df_clientes = pd.DataFrame([_fila_cliente_prueba().drop("score")], index=pd.Index([1], name="ClienteId"))
+    monkeypatch.setattr(extract, "extraer_features", lambda: df_clientes)
+    monkeypatch.setattr(score, "calcular_scores", lambda df: pd.DataFrame({"score": [415.0]}, index=df.index))
+    monkeypatch.setattr(rules, "asignar_segmento", lambda s: 3)
+    monkeypatch.setattr(rules, "aplicar_overrides", lambda cliente, seg_id: "ALTO")
+    monkeypatch.setattr(rules, "resolver_segmento_final", lambda seg_id, codigo: 3)
+    monkeypatch.setattr(rules, "recomendar_plazo", lambda codigo: 2)
+    monkeypatch.setattr(rules, "clasificar_cliente", lambda cliente: "B")
+    monkeypatch.setattr(rules, "resolver_clasificacion_id", lambda codigo: 2)
+    monkeypatch.setattr(rules, "marcar_revision", lambda cliente, codigo: False)
+    monkeypatch.setattr(writeback, "guardar_resultados", lambda df, dry_run=False, **k: {"modo": "real", "total": len(df), "cambiaron_segmento": [], "sin_cambios": [1], "fallidos": []})
+
+    llamadas = []
+    monkeypatch.setattr(extract, "agregar_historial_evaluable", lambda df: (llamadas.append(df) or df.assign(TieneHistorial=True)))
+
+    main.comando_scorear(dry_run=False)
+
+    assert len(llamadas) == 1
+    assert list(llamadas[0].index) == [1]
+
+
+def test_comando_scorear_con_clientes_ids_filtra_la_poblacion(monkeypatch):
+    """Reevaluación bajo demanda (cola dbo.ColaRescoreo): clientes_ids
+    debe limitar qué filas de extraer_features() llegan a score/writeback,
+    sin tocar la consulta SQL de la vista."""
+    _aislar_controles_scorear(monkeypatch)
+    df_clientes = pd.DataFrame(
+        [_fila_cliente_prueba().drop("score"), _fila_cliente_prueba().drop("score")],
+        index=pd.Index([1, 2], name="ClienteId"),
+    )
+    monkeypatch.setattr(extract, "extraer_features", lambda: df_clientes)
+    monkeypatch.setattr(score, "calcular_scores", lambda df: pd.DataFrame({"score": [415.0] * len(df)}, index=df.index))
+
+    monkeypatch.setattr(rules, "asignar_segmento", lambda s: 3)
+    monkeypatch.setattr(rules, "aplicar_overrides", lambda cliente, seg_id: "ALTO")
+    monkeypatch.setattr(rules, "resolver_segmento_final", lambda seg_id, codigo: 3)
+    monkeypatch.setattr(rules, "recomendar_plazo", lambda codigo: 2)
+    monkeypatch.setattr(rules, "clasificar_cliente", lambda cliente: "B")
+    monkeypatch.setattr(rules, "resolver_clasificacion_id", lambda codigo: 2)
+    monkeypatch.setattr(rules, "marcar_revision", lambda cliente, codigo: False)
+
+    llamadas = {}
+
+    def _guardar_resultados_falso(df, dry_run=False, **k):
+        llamadas["df"] = df
+        return {"modo": "real", "total": len(df), "cambiaron_segmento": [], "sin_cambios": list(df["ClienteId"]), "fallidos": []}
+
+    monkeypatch.setattr(writeback, "guardar_resultados", _guardar_resultados_falso)
+
+    resultado = main.comando_scorear(dry_run=False, clientes_ids=[2])
+
+    assert resultado == 1
+    assert list(llamadas["df"]["ClienteId"]) == [2]
+
+
+def test_comando_scorear_con_clientes_ids_sin_coincidencias_no_llama_a_writeback(monkeypatch):
+    _aislar_controles_scorear(monkeypatch)
+    df_clientes = pd.DataFrame([_fila_cliente_prueba().drop("score")], index=pd.Index([1], name="ClienteId"))
+    monkeypatch.setattr(extract, "extraer_features", lambda: df_clientes)
+
+    def _writeback_no_debe_llamarse(*a, **k):
+        raise AssertionError("writeback.guardar_resultados no debía llamarse sin clientes coincidentes")
+
+    monkeypatch.setattr(writeback, "guardar_resultados", _writeback_no_debe_llamarse)
+
+    resultado = main.comando_scorear(dry_run=False, clientes_ids=[999])
+
+    assert resultado == 0
 
 
 def test_comando_scorear_no_lanza_si_hay_fallidos(monkeypatch):

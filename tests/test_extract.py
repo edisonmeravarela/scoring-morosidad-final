@@ -89,6 +89,45 @@ def _df_entrenamiento(n_con_historial: int, n_sin_historial: int) -> pd.DataFram
     )
 
 
+def _df_historial(n: int) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "ClienteId": range(1, n + 1),
+            "FacturasResueltas": [5] * n,
+            "UmbralVigente": [3] * n,
+            "TieneHistorial": [1] * n,
+        }
+    )
+
+
+def test_agregar_historial_evaluable_incorpora_las_tres_columnas():
+    df = _df_de(3).set_index("ClienteId")
+    with patch("src.extract.read_sql", return_value=_df_historial(3)):
+        resultado = extract.agregar_historial_evaluable(df)
+    assert list(resultado["TieneHistorial"]) == [1, 1, 1]
+    assert list(resultado["FacturasResueltas"]) == [5, 5, 5]
+    assert list(resultado["UmbralVigente"]) == [3, 3, 3]
+    assert resultado.index.name == "ClienteId"
+
+
+def test_agregar_historial_evaluable_no_descarta_clientes_sin_fila_de_historial():
+    # left join: un cliente que por lo que sea no aparezca en
+    # dbo.vw_HistorialClienteActual no debe perderse de df_clientes.
+    df = _df_de(3).set_index("ClienteId")
+    with patch("src.extract.read_sql", return_value=_df_historial(2)):
+        resultado = extract.agregar_historial_evaluable(df)
+    assert len(resultado) == 3
+    assert pd.isna(resultado.loc[3, "TieneHistorial"])
+
+
+def test_agregar_historial_evaluable_sobre_datos_reales():
+    df = extract.extraer_features()
+    resultado = extract.agregar_historial_evaluable(df)
+    assert len(resultado) == len(df)
+    assert "TieneHistorial" in resultado.columns
+    assert resultado["TieneHistorial"].isin([0, 1]).all()
+
+
 def test_excluir_sin_historial_descarta_solo_esas_filas():
     df = _df_entrenamiento(n_con_historial=7, n_sin_historial=3)
     resultado = extract.excluir_sin_historial(df)

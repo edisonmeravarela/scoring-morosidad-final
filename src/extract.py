@@ -82,6 +82,26 @@ def extraer_dataset_entrenamiento() -> pd.DataFrame:
     return _extraer_vista(vista, minimo, "facturas", "FacturaId")
 
 
+def agregar_historial_evaluable(df: pd.DataFrame) -> pd.DataFrame:
+    """Incorpora FacturasResueltas/UmbralVigente/TieneHistorial desde
+    dbo.vw_HistorialClienteActual, indexado por ClienteId igual que
+    extraer_features() — fuente única del criterio de "historial
+    evaluable" (dbo.ParametroScoring.MIN_FACTURAS_HISTORIAL vía
+    dbo.fn_HistorialCliente), compartida con el entrenamiento
+    (SinHistorialPago de vw_DatasetEntrenamientoFactura) y la cola de
+    reevaluación bajo demanda (TR_Abono_EncolarRescoreo). Antes de esto,
+    src/rules.py contaba `NumFacturas` por su cuenta con su propio umbral
+    (config.reglas.minimo_facturas_para_evaluar) sin exigir que el
+    vencimiento ya hubiera transcurrido — un tercer criterio divergente
+    de los otros dos. Paso aparte, igual que excluir_sin_historial(), no
+    integrado en extraer_features(): mantiene esa función simple y
+    permite probarlo por separado."""
+    historial = read_sql(
+        "SELECT ClienteId, FacturasResueltas, UmbralVigente, TieneHistorial FROM dbo.vw_HistorialClienteActual"
+    ).set_index("ClienteId")
+    return df.join(historial, how="left")
+
+
 def excluir_sin_historial(df: pd.DataFrame) -> pd.DataFrame:
     """Descarta las filas con SinHistorialPago = 1: un cliente sin
     facturas previas ya vencidas no tiene comportamiento de pago que
