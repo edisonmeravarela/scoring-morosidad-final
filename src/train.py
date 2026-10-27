@@ -13,14 +13,18 @@ en este archivo sin usar, solo para comparar.
 
 Controles de fuga aplicados en este paso (además de los de features.py):
 KS y AUC mínimos, y techo de AUC sospechoso, todos calculados sobre la
-validación cruzada agrupada fuera de muestra (src/ajustes_evaluacion.py:
-metricas_fuera_de_muestra/decidir_promocion) — el holdout temporal solo
-veta. Si el modelo no cumple, se rechaza y NO se sobrescribe el modelo
-anterior en models/.
+validación cruzada agrupada fuera de muestra (metricas_fuera_de_muestra,
+en src/ajustes_evaluacion.py; UmbralesAceptacion/cargar_umbrales/
+modelo_aceptado, aquí mismo, más abajo) — el holdout temporal solo veta
+(decidir_promocion, src/ajustes_evaluacion.py). Si el modelo no cumple, se
+rechaza y NO se sobrescribe el modelo anterior en models/.
 """
+
+from __future__ import annotations
 
 import logging
 import math
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -31,9 +35,14 @@ from scipy.stats import ks_2samp
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 
-from src.ajustes_evaluacion import decidir_promocion, dividir_particion_agrupada, metricas_fuera_de_muestra
+from src.ajustes_evaluacion import (
+    decidir_promocion,
+    dividir_particion_agrupada,
+    metricas_fuera_de_muestra,
+)
 from src.calidad import validar_antes_de_entrenar
 from src.config import RAIZ_PROYECTO, cargar_config
+from src.db import consultar_escalar
 from src.drift import registrar_baseline
 from src.esquema import validar_esquema
 from src.evaluacion import evaluar_modelo
@@ -68,6 +77,120 @@ class DatosInsuficientesError(Exception):
 
 def _config_entrenamiento() -> dict:
     return cargar_config().get("entrenamiento", {})
+
+
+def _consultar_parametro_scoring(codigo: str) -> float | None:
+    """Wrapper de acceso a base para cargar_umbrales(): lee un umbral de
+    dbo.ParametroScoring vía dbo.fn_ParametroScoring."""
+    fila = consultar_escalar("SELECT dbo.fn_ParametroScoring(?)", (codigo,))
+    return float(fila) if fila is not None else None
+
+
+# ============================================================================
+# Piso de AUC en el criterio de aceptación (incidente 20261007_183452 y
+# corridas posteriores: KS 0.75/AUC 0.25 quedaba aceptado porque solo había
+# piso de KS y techo de AUC, nunca piso de AUC). Integrado de
+# ajustes/piso_auc.py, conservando la lógica tal cual estaba decidida.
+# ============================================================================
+
+# Valores de respaldo de los tres umbrales de aceptación. Se usan solo si
+# dbo.ParametroScoring no responde: un entrenamiento nunca debe quedarse sin
+# criterio de aceptación, y tampoco debe aceptar por ausencia de criterio.
+# Son deliberadamente iguales a los de la base.
+RESPALDO_UMBRALES = {"KS_MINIMO": 0.25, "AUC_MINIMO": 0.60, "AUC_MAXIMO": 0.95}
+
+# Por debajo de este valor el ordenamiento está literalmente invertido.
+# No es un umbral configurable: es la definición del AUC.
+AZAR = 0.50
+
+
+@dataclass(frozen=True)
+class UmbralesAceptacion:
+    """Los tres umbrales que deciden si un modelo puede promoverse."""
+
+    ks_minimo: float
+    auc_minimo: float
+    auc_maximo: float
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.ks_minimo <= 1.0:
+            raise ValueError(f"ks_minimo fuera de rango: {self.ks_minimo}")
+        if not 0.0 <= self.auc_minimo < self.auc_maximo <= 1.0:
+            raise ValueError(
+                f"umbrales de AUC incoherentes: minimo {self.auc_minimo}, "
+                f"maximo {self.auc_maximo}"
+            )
+        if self.auc_minimo < AZAR:
+            # No se bloquea, pero debe quedar dicho: un piso por debajo del
+            # azar no protege de nada.
+            logger.warning(
+                "El piso de AUC (%.4f) esta por debajo del azar (%.2f): "
+                "un modelo con el ordenamiento invertido pasaria el filtro.",
+                self.auc_minimo, AZAR,
+            )
+
+
+def cargar_umbrales(consultar=None) -> UmbralesAceptacion:
+    """Lee los tres umbrales de dbo.ParametroScoring.
+
+    `consultar(codigo) -> float | None` es la función de acceso a base del
+    proyecto — en este módulo, `_consultar_parametro_scoring`, que envuelve
+    `src/db.py::consultar_escalar` sobre `dbo.fn_ParametroScoring`. Si la
+    consulta falla o devuelve NULL se usa el valor de respaldo y se deja
+    constancia en el log. Nunca se omite la comprobación.
+    """
+    valores = dict(RESPALDO_UMBRALES)
+    if consultar is None:
+        logger.warning("Sin acceso a dbo.ParametroScoring: se usan los umbrales de respaldo.")
+        return UmbralesAceptacion(valores["KS_MINIMO"], valores["AUC_MINIMO"],
+                                  valores["AUC_MAXIMO"])
+
+    for codigo in RESPALDO_UMBRALES:
+        try:
+            valor = consultar(codigo)
+        except Exception:
+            logger.exception("Fallo al leer %s; se usa el respaldo %.4f.",
+                             codigo, RESPALDO_UMBRALES[codigo])
+            continue
+        if valor is None:
+            logger.warning("%s no esta definido en dbo.ParametroScoring; "
+                           "se usa el respaldo %.4f.", codigo, RESPALDO_UMBRALES[codigo])
+            continue
+        valores[codigo] = float(valor)
+
+    return UmbralesAceptacion(valores["KS_MINIMO"], valores["AUC_MINIMO"],
+                              valores["AUC_MAXIMO"])
+
+
+def modelo_aceptado(ks: float, auc: float,
+                    umbrales: UmbralesAceptacion) -> tuple[bool, str | None]:
+    """Decide si el modelo puede sobrescribir al vigente, a partir de KS/AUC.
+
+    Devuelve (aceptado, motivo_rechazo). El motivo es None cuando se acepta.
+
+    El orden de las comprobaciones es deliberado: KS, piso de AUC, techo de
+    AUC. Cuando una corrida falla por varias razones a la vez, el motivo que
+    queda registrado es el más fundamental y no el primero que aparezca por
+    casualidad.
+    """
+    if ks != ks or auc != auc:          # NaN: ninguna comparación sería válida
+        return False, "KS o AUC no son numeros: la evaluacion no se completo"
+
+    if ks < umbrales.ks_minimo:
+        return False, (f"KS {ks:.4f} por debajo del minimo "
+                       f"{umbrales.ks_minimo:.4f}")
+
+    if auc < umbrales.auc_minimo:
+        detalle = ("ordenamiento invertido" if auc < AZAR
+                   else "poder predictivo insuficiente")
+        return False, (f"AUC {auc:.4f} por debajo del minimo "
+                       f"{umbrales.auc_minimo:.4f} ({detalle})")
+
+    if auc > umbrales.auc_maximo:
+        return False, (f"AUC {auc:.4f} sobre el techo "
+                       f"{umbrales.auc_maximo:.4f}: indicio de fuga de informacion")
+
+    return True, None
 
 
 def dividir_temporal_por_cliente(
@@ -257,6 +380,7 @@ def entrenar() -> dict:
 
     config = _config_entrenamiento()
     target_col = config.get("columna_target", "Target")
+    umbrales = cargar_umbrales(consultar=_consultar_parametro_scoring)
 
     df = extraer_dataset_entrenamiento()
     if config.get("excluir_sin_historial", True):
@@ -291,14 +415,12 @@ def entrenar() -> dict:
     auc = float(roc_auc_score(y_val, proba_val))
     ks = calcular_ks(y_val, proba_val)
 
-    ks_minimo = config.get("ks_minimo", 0.25)
-    auc_maximo = config.get("auc_maximo_sospechoso", 0.95)
     logger.info(
         "Validación (regresión logística): AUC=%.4f, KS=%.4f (umbrales: KS>=%.2f, AUC<=%.2f).",
         auc,
         ks,
-        ks_minimo,
-        auc_maximo,
+        umbrales.ks_minimo,
+        umbrales.auc_maximo,
     )
 
     # Etiqueta de versión calculada ya aquí (y no más abajo, tras el
@@ -368,13 +490,14 @@ def entrenar() -> dict:
         except DatosInsuficientesError:
             pass
 
-    # Criterio de aceptación (src/ajustes_evaluacion.py:decidir_promocion):
-    # la validación cruzada agrupada por cliente gobierna (oof), calculada
-    # aquí de forma independiente de evaluar_modelo() —que necesita base de
-    # datos real y cuyo fallo nunca debe impedir la aceptación— para que la
-    # decisión siga siendo verificable sin conexión a SQL Server. El
-    # holdout temporal (ventana x_val/y_val, ya calculada arriba) solo veta,
-    # nunca promueve por sí solo.
+    # Criterio de aceptación: la validación cruzada agrupada por cliente
+    # gobierna (oof), calculada aquí de forma independiente de
+    # evaluar_modelo() —que necesita base de datos real y cuyo fallo nunca
+    # debe impedir la aceptación— para que la decisión siga siendo
+    # verificable sin conexión a SQL Server. El holdout temporal (ventana
+    # x_val/y_val, ya calculada arriba) solo veta, nunca promueve por sí
+    # solo (decidir_promocion, src/ajustes_evaluacion.py). El piso/techo de
+    # KS/AUC propiamente dichos los decide modelo_aceptado(), aquí mismo.
     def _ajustar_y_predecir(df_train, df_test):
         x_train_fold, mapeo_fold = preparar_features(df_train, target_col=target_col)
         x_test_fold = transformar_a_woe(df_test, mapeo_fold)
@@ -390,7 +513,8 @@ def entrenar() -> dict:
     )
     holdout = {"auc": auc, "n_evaluados": len(y_val)}
     cfg_decision = SimpleNamespace(train=SimpleNamespace(**config))
-    aceptado, motivo = decidir_promocion(oof, holdout, cfg_decision)
+    aceptado_ks_auc, motivo_ks_auc = modelo_aceptado(oof["ks"], oof["auc"], umbrales)
+    aceptado, motivo = decidir_promocion(oof, holdout, cfg_decision, aceptado_ks_auc, motivo_ks_auc)
     if not aceptado:
         logger.error(motivo)
         raise ModeloRechazadoError(motivo)

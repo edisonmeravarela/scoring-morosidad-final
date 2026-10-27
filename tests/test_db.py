@@ -62,6 +62,18 @@ def test_read_sql_puede_consultar_una_tabla_real_del_esquema():
     assert len(df) <= 5
 
 
+def test_consultar_escalar_lee_un_umbral_real_de_dbo_parametroscoring():
+    # Verificación en vivo: dbo.fn_ParametroScoring('KS_MINIMO') es el
+    # umbral real que ahora lee cargar_umbrales() (src/ajustes_evaluacion.py).
+    valor = db.consultar_escalar("SELECT dbo.fn_ParametroScoring(?)", ("KS_MINIMO",))
+    assert float(valor) == 0.25
+
+
+def test_consultar_escalar_devuelve_none_si_el_codigo_no_existe():
+    valor = db.consultar_escalar("SELECT dbo.fn_ParametroScoring(?)", ("CODIGO_INEXISTENTE",))
+    assert valor is None
+
+
 def test_ejecutar_multi_resultset_devuelve_los_dos_result_sets_de_sp_validaresquema():
     # dbo.sp_ValidarEsquema (control de esquema) devuelve detalle +
     # veredicto en la misma llamada — pd.read_sql() solo captura el primero.

@@ -92,15 +92,11 @@ entrenamiento:
   # ya existente) como para KS/AUC fuera de muestra (src/ajustes_evaluacion.py:
   # metricas_fuera_de_muestra) — misma partición conceptual para ambos.
   n_particiones_crossval: 5
-  # Criterios de aceptación del paso 8.5: KS mínimo y AUC mínimo de la
-  # validación cruzada fuera de muestra (antes solo se exigía un techo de
-  # AUC: un modelo con AUC 0,25 —que ordena al revés— pasaba el filtro),
-  # y el "test de fuga" — techo de AUC, porque en scoring crediticio real
-  # 0.75–0.85 es un buen modelo y ~0.98 casi siempre significa que algo se
-  # filtró.
-  ks_minimo: 0.25
-  auc_minimo: 0.60
-  auc_maximo_sospechoso: 0.95
+  # Los criterios de aceptación del paso 8.5 (KS mínimo, AUC mínimo, techo
+  # de AUC) ya NO se leen de aquí: dbo.ParametroScoring es la única fuente
+  # (src/ajustes_evaluacion.py::cargar_umbrales, vía dbo.fn_ParametroScoring).
+  # Mantener los tres umbrales también aquí invitaba a editarlos pensando
+  # que cambiaban el criterio real.
   # Escalado del score tipo FICO: score = offset + factor * ln(odds_bueno).
   # Anclas arbitrarias mientras no haya tasa de mora observada para
   # calibrar contra percentiles reales (sección 7): revisar cuando el área

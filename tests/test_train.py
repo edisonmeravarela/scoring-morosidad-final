@@ -3,6 +3,7 @@ import pandas as pd
 import pytest
 
 from src import calidad, esquema, extract, train
+from src.train import UmbralesAceptacion, cargar_umbrales, modelo_aceptado
 
 
 def _veredicto_calidad_ok() -> dict:
@@ -77,9 +78,6 @@ def _config_entrenamiento_prueba(**overrides) -> dict:
         "meses_validacion": 2,
         "class_weight": "balanced",
         "entrenar_xgboost": False,
-        "ks_minimo": 0.0,
-        "auc_minimo": 0.0,
-        "auc_maximo_sospechoso": 0.95,
         "score_base": 600,
         "odds_base": 50,
         "pdo": 20,
@@ -184,6 +182,91 @@ def test_guardar_modelo_versiona_con_fecha_y_actualiza_ruta_estable(tmp_path, mo
     assert len(versionados) == 1
 
 
+def _umbrales_reales() -> UmbralesAceptacion:
+    return UmbralesAceptacion(ks_minimo=0.25, auc_minimo=0.60, auc_maximo=0.95)
+
+
+# Los 6 casos del incidente real (corridas 20261007_183452 y posteriores:
+# KS 0.75/AUC 0.25 quedó marcado Aceptado=1 en dbo.EvaluacionModelo porque
+# dbo.sp_RegistrarEvaluacion no tiene piso de AUC). modelo_aceptado() —el
+# lado Python— sí debe rechazar ese caso.
+@pytest.mark.parametrize(
+    "ks,auc,aceptado_esperado,fragmento_motivo,descripcion",
+    [
+        (0.7500, 0.2500, False, "ordenamiento invertido",
+         "Ordenamiento invertido: el caso real registrado como aceptado"),
+        (0.4000, 0.5900, False, "poder predictivo insuficiente",
+         "Justo por debajo del piso: la comparacion es estricta"),
+        (0.4000, 0.6000, True, None,
+         "Justo en el piso: es inclusivo, no excluye por un decimal"),
+        (0.3071, 0.6880, True, None,
+         "El modelo vigente: el cambio no debe bloquearlo"),
+        (0.8000, 0.9700, False, "fuga de informacion",
+         "Indicio de fuga: rechaza por el techo, no por el piso"),
+        (0.2000, 0.2500, False, "KS",
+         "Falla por KS y por AUC: el motivo registrado es el mas fundamental"),
+    ],
+)
+def test_modelo_aceptado_casos_del_incidente(ks, auc, aceptado_esperado, fragmento_motivo, descripcion):
+    aceptado, motivo = modelo_aceptado(ks, auc, _umbrales_reales())
+    assert aceptado == aceptado_esperado, descripcion
+    if fragmento_motivo is None:
+        assert motivo is None
+    else:
+        assert fragmento_motivo in motivo
+
+
+def test_modelo_aceptado_con_ks_o_auc_nan_rechaza_sin_comparar():
+    # Si la evaluación no se completó, el valor que llega es NaN y toda
+    # comparación con NaN da falso en Python: sin esta guarda explícita,
+    # un NaN atraviesa las tres condiciones sin activar ninguna y el
+    # modelo quedaría aceptado por omisión.
+    aceptado, motivo = modelo_aceptado(float("nan"), 0.70, _umbrales_reales())
+    assert aceptado is False
+    assert "no son numeros" in motivo
+
+
+def test_umbrales_aceptacion_rechaza_piso_de_auc_por_encima_del_techo():
+    with pytest.raises(ValueError, match="incoherentes"):
+        UmbralesAceptacion(ks_minimo=0.25, auc_minimo=0.95, auc_maximo=0.60)
+
+
+def test_umbrales_aceptacion_rechaza_techo_de_auc_fuera_de_rango():
+    with pytest.raises(ValueError, match="fuera de rango|incoherentes"):
+        UmbralesAceptacion(ks_minimo=0.25, auc_minimo=0.60, auc_maximo=1.40)
+
+
+def test_cargar_umbrales_sin_consultar_usa_el_respaldo():
+    umbrales = cargar_umbrales(consultar=None)
+    assert umbrales == train.UmbralesAceptacion(
+        train.RESPALDO_UMBRALES["KS_MINIMO"], train.RESPALDO_UMBRALES["AUC_MINIMO"],
+        train.RESPALDO_UMBRALES["AUC_MAXIMO"],
+    )
+
+
+def test_cargar_umbrales_cae_al_respaldo_si_consultar_lanza_excepcion():
+    def consultar_roto(codigo):
+        raise RuntimeError("sin conexion a la base")
+
+    umbrales = cargar_umbrales(consultar=consultar_roto)
+    assert umbrales.ks_minimo == train.RESPALDO_UMBRALES["KS_MINIMO"]
+    assert umbrales.auc_minimo == train.RESPALDO_UMBRALES["AUC_MINIMO"]
+    assert umbrales.auc_maximo == train.RESPALDO_UMBRALES["AUC_MAXIMO"]
+
+
+def test_cargar_umbrales_cae_al_respaldo_si_consultar_devuelve_none():
+    umbrales = cargar_umbrales(consultar=lambda codigo: None)
+    assert umbrales.ks_minimo == train.RESPALDO_UMBRALES["KS_MINIMO"]
+    assert umbrales.auc_minimo == train.RESPALDO_UMBRALES["AUC_MINIMO"]
+    assert umbrales.auc_maximo == train.RESPALDO_UMBRALES["AUC_MAXIMO"]
+
+
+def test_cargar_umbrales_usa_los_valores_que_devuelve_consultar():
+    valores = {"KS_MINIMO": 0.30, "AUC_MINIMO": 0.65, "AUC_MAXIMO": 0.90}
+    umbrales = cargar_umbrales(consultar=lambda codigo: valores[codigo])
+    assert umbrales == UmbralesAceptacion(0.30, 0.65, 0.90)
+
+
 def test_entrenar_rechaza_por_ks_bajo_y_no_sobrescribe_modelo_anterior(monkeypatch, tmp_path):
     df = _dataset_entrenamiento_sintetico()
     monkeypatch.setattr(train, "extraer_dataset_entrenamiento", lambda: df)
@@ -194,13 +277,46 @@ def test_entrenar_rechaza_por_ks_bajo_y_no_sobrescribe_modelo_anterior(monkeypat
     ruta_scorecard = tmp_path / "scorecard.csv"
 
     config = _config_entrenamiento_prueba(
-        ks_minimo=0.999,  # inalcanzable -> fuerza el rechazo
         ruta_modelo=str(ruta_modelo),
         ruta_scorecard=str(ruta_scorecard),
     )
     monkeypatch.setattr(train, "_config_entrenamiento", lambda: config)
+    monkeypatch.setattr(
+        train, "cargar_umbrales",
+        lambda consultar=None: UmbralesAceptacion(ks_minimo=0.999, auc_minimo=0.0, auc_maximo=0.95),
+    )  # KS inalcanzable -> fuerza el rechazo
 
     with pytest.raises(train.ModeloRechazadoError, match="KS"):
+        train.entrenar()
+
+    assert ruta_modelo.read_bytes() == b"MODELO ANTERIOR"  # no se sobrescribió
+    assert not ruta_scorecard.exists()  # tampoco se llegó a generar el scorecard
+
+
+def test_entrenar_rechaza_por_auc_bajo_y_no_sobrescribe_modelo_anterior(monkeypatch, tmp_path):
+    # El gap que faltaba: KS-bajo y AUC-techo ya tenían su prueba de
+    # integración completa de entrenar(); el piso de AUC (el defecto real
+    # del incidente 20261007_183452/20261026_*) solo estaba probado como
+    # función pura (modelo_aceptado), nunca de punta a punta.
+    df = _dataset_entrenamiento_sintetico()
+    monkeypatch.setattr(train, "extraer_dataset_entrenamiento", lambda: df)
+    _aislar_controles_previos(monkeypatch)
+
+    ruta_modelo = tmp_path / "modelo.pkl"
+    ruta_modelo.write_bytes(b"MODELO ANTERIOR")
+    ruta_scorecard = tmp_path / "scorecard.csv"
+
+    config = _config_entrenamiento_prueba(
+        ruta_modelo=str(ruta_modelo),
+        ruta_scorecard=str(ruta_scorecard),
+    )
+    monkeypatch.setattr(train, "_config_entrenamiento", lambda: config)
+    monkeypatch.setattr(
+        train, "cargar_umbrales",
+        lambda consultar=None: UmbralesAceptacion(ks_minimo=0.0, auc_minimo=0.999, auc_maximo=1.0),
+    )  # piso de AUC inalcanzable -> fuerza el rechazo por el piso, no por el techo
+
+    with pytest.raises(train.ModeloRechazadoError, match="AUC .* por debajo del minimo"):
         train.entrenar()
 
     assert ruta_modelo.read_bytes() == b"MODELO ANTERIOR"  # no se sobrescribió
@@ -214,12 +330,14 @@ def test_entrenar_rechaza_por_auc_sospechoso_de_fuga(monkeypatch, tmp_path):
 
     ruta_modelo = tmp_path / "modelo.pkl"
     config = _config_entrenamiento_prueba(
-        ks_minimo=0.0,  # que no bloquee por KS
-        auc_maximo_sospechoso=-1,  # inalcanzable de cumplir -> siempre "sospechoso"
         ruta_modelo=str(ruta_modelo),
         ruta_scorecard=str(tmp_path / "scorecard.csv"),
     )
     monkeypatch.setattr(train, "_config_entrenamiento", lambda: config)
+    monkeypatch.setattr(
+        train, "cargar_umbrales",
+        lambda consultar=None: UmbralesAceptacion(ks_minimo=0.0, auc_minimo=0.0, auc_maximo=0.01),
+    )  # techo casi en 0 -> cualquier AUC real lo supera, siempre "sospechoso"
 
     with pytest.raises(train.ModeloRechazadoError, match="AUC"):
         train.entrenar()
@@ -236,6 +354,10 @@ def test_entrenar_acepta_y_guarda_con_umbrales_razonables(monkeypatch, tmp_path)
     ruta_scorecard = tmp_path / "scorecard.csv"
     config = _config_entrenamiento_prueba(ruta_modelo=str(ruta_modelo), ruta_scorecard=str(ruta_scorecard))
     monkeypatch.setattr(train, "_config_entrenamiento", lambda: config)
+    monkeypatch.setattr(
+        train, "cargar_umbrales",
+        lambda consultar=None: UmbralesAceptacion(ks_minimo=0.0, auc_minimo=0.0, auc_maximo=0.95),
+    )  # umbrales laxos: el dataset sintético no debe depender de su KS/AUC real
 
     resultado = train.entrenar()
     assert ruta_modelo.exists()

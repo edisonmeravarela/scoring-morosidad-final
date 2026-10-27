@@ -47,7 +47,14 @@ CÓMO CONECTARLO
   config/config.yaml
       - Ver CONFIG_SUGERIDA al final de este archivo.
 
-No modifica ningún objeto de la base de datos.
+Los tres umbrales de aceptación (KS mínimo, AUC mínimo, AUC máximo) ya NO
+viven en config.yaml: `UmbralesAceptacion`/`cargar_umbrales`/`modelo_aceptado`
+viven en `src/train.py` (junto al resto del criterio de aceptación) y leen
+de dbo.ParametroScoring vía dbo.fn_ParametroScoring (envolviendo
+src/db.py::consultar_escalar), con un respaldo si la base no responde.
+`decidir_promocion()` de este módulo ya no calcula KS/AUC: recibe el
+resultado de `modelo_aceptado()` ya calculado por `train.py`, y solo añade
+la comprobación de particiones válidas y el veto del holdout temporal.
 """
 
 from __future__ import annotations
@@ -272,27 +279,26 @@ def metricas_fuera_de_muestra(
 # ============================================================================
 # 3. Criterio de promoción
 # ============================================================================
-def decidir_promocion(oof: dict, holdout: dict | None, cfg) -> tuple[bool, str | None]:
+def decidir_promocion(oof: dict, holdout: dict | None, cfg,
+                      aceptado_ks_auc: bool, motivo_ks_auc: str | None) -> tuple[bool, str | None]:
     """Decide si el modelo se promueve.
 
     La métrica que gobierna es la de validación cruzada, porque evalúa a
     todos los clientes. El holdout temporal solo puede VETAR —nunca promover
     por sí solo— y únicamente si tiene tamaño suficiente para significar algo.
+
+    `aceptado_ks_auc`/`motivo_ks_auc` son el resultado ya calculado por
+    `train.py::modelo_aceptado(oof["ks"], oof["auc"], umbrales)` — este
+    módulo no importa `train.py` (evitaría un import circular, ya que
+    `train.py` importa `decidir_promocion` de aquí) ni conoce los umbrales.
     """
-    ks_min = getattr(cfg.train, "ks_minimo", 0.25)
-    auc_min = getattr(cfg.train, "auc_minimo", 0.60)
-    auc_max = getattr(cfg.train, "auc_maximo_sospechoso", 0.95)
     min_filas_holdout = getattr(cfg.train, "min_filas_validacion", 30)
 
     if oof["n_particiones_validas"] < 3:
         return False, "menos de 3 particiones válidas: el resultado no es estimable"
-    if oof["ks"] < ks_min:
-        return False, f"KS fuera de muestra {oof['ks']:.4f} por debajo de {ks_min}"
-    if oof["auc"] < auc_min:
-        detalle = "ordena al revés" if oof["auc"] < 0.50 else "poder predictivo insuficiente"
-        return False, f"AUC fuera de muestra {oof['auc']:.4f} por debajo de {auc_min} ({detalle})"
-    if oof["auc"] > auc_max:
-        return False, f"AUC fuera de muestra {oof['auc']:.4f} sobre el techo {auc_max}: indicio de fuga"
+
+    if not aceptado_ks_auc:
+        return False, f"{motivo_ks_auc} (fuera de muestra)"
 
     # El holdout temporal solo veta, y solo si es interpretable.
     if holdout and holdout.get("n_evaluados", 0) >= min_filas_holdout:
@@ -326,8 +332,6 @@ train:
   # --- evaluación --------------------------------------------------------
   n_particiones_crossval: 5
 
-  # --- criterios de aceptación -------------------------------------------
-  ks_minimo: 0.25
-  auc_minimo: 0.60               # NUEVO: sin esto se acepta un AUC de 0,25
-  auc_maximo_sospechoso: 0.95
+  # Los criterios de aceptación (KS mínimo, AUC mínimo, AUC máximo) NO van
+  # aquí: viven en dbo.ParametroScoring, leídos por cargar_umbrales().
 """

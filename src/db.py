@@ -60,6 +60,16 @@ def read_sql(query: str, params: tuple | dict | None = None) -> pd.DataFrame:
         return pd.read_sql(query, conn, params=params)
 
 
+def consultar_escalar(query: str, params: tuple | dict | None = None):
+    """Ejecuta `query` y devuelve el valor de su primera columna en su
+    primera fila, o None si no hay resultados (p. ej. un parámetro
+    inexistente en dbo.ParametroScoring vía dbo.fn_ParametroScoring)."""
+    df = read_sql(query, params)
+    if df.empty:
+        return None
+    return df.iloc[0, 0]
+
+
 def ejecutar_multi_resultset(query: str, params: tuple | None = None) -> list[pd.DataFrame]:
     """Ejecuta una sentencia que devuelve varios *result sets* (p. ej. un
     procedimiento almacenado con más de un SELECT, como
