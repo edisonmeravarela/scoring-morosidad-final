@@ -4,20 +4,26 @@ Dataset: dbo.vw_DatasetEntrenamientoFactura (point-in-time, una fila por
 factura), excluyendo SinHistorialPago=1 — nunca dbo.vw_FeaturesScoringCliente,
 que es solo para inferencia (ver docstring de src/extract.py).
 
-Split: temporal por FechaEmision (nunca aleatorio) y, sobre ese resultado,
-purga de validación de cualquier cliente que también aparezca en
-entrenamiento (documento, sección 4.4, "Agrupación por cliente") — así
-ningún cliente está en ambos conjuntos.
+Split: partición 80/20 agrupada por cliente (src/ajustes_evaluacion.py:
+dividir_particion_agrupada — nunca aleatoria por fila), sin solapamiento
+y sin necesidad de purgar (documento, sección 4.4, "Agrupación por
+cliente") — ningún cliente está en ambos conjuntos a la vez. La función
+`dividir_temporal_por_cliente()` (corte por FechaEmision + purga) se deja
+en este archivo sin usar, solo para comparar.
 
 Controles de fuga aplicados en este paso (además de los de features.py):
-KS mínimo de validación y techo de AUC sospechoso. Si el modelo no los
-cumple, se rechaza y NO se sobrescribe el modelo anterior en models/.
+KS y AUC mínimos, y techo de AUC sospechoso, todos calculados sobre la
+validación cruzada agrupada fuera de muestra (src/ajustes_evaluacion.py:
+metricas_fuera_de_muestra/decidir_promocion) — el holdout temporal solo
+veta. Si el modelo no cumple, se rechaza y NO se sobrescribe el modelo
+anterior en models/.
 """
 
 import logging
 import math
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import joblib
 import pandas as pd
@@ -25,6 +31,7 @@ from scipy.stats import ks_2samp
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 
+from src.ajustes_evaluacion import decidir_promocion, dividir_particion_agrupada, metricas_fuera_de_muestra
 from src.calidad import validar_antes_de_entrenar
 from src.config import RAIZ_PROYECTO, cargar_config
 from src.drift import registrar_baseline
@@ -234,7 +241,8 @@ def entrenar() -> dict:
     """Orquesta el paso 8.5 completo. Devuelve el dict con el modelo, el
     mapeo WOE, las columnas del modelo y las métricas de validación.
     Lanza ModeloRechazadoError sin escribir nada en models/ si el modelo
-    no cumple los criterios de aceptación (KS mínimo, techo de AUC).
+    no cumple los criterios de aceptación de decidir_promocion() (KS y AUC
+    mínimos, techo de AUC) sobre la validación cruzada fuera de muestra.
 
     Antes de extraer nada, corre los dos primeros controles del
     documento "Controles de Esquema, Calidad y Deriva de Datos", en su
@@ -254,7 +262,16 @@ def entrenar() -> dict:
     if config.get("excluir_sin_historial", True):
         df = excluir_sin_historial(df)
 
-    train_df, val_df = dividir_temporal_por_cliente(df)
+    train_df, val_df = dividir_particion_agrupada(
+        df,
+        fecha_col=config.get("columna_fecha", "FechaEmision"),
+        cliente_col=config.get("columna_cliente", "ClienteId"),
+        target_col=target_col,
+        prop_validacion=config.get("prop_validacion", 0.20),
+        min_filas_validacion=config.get("min_filas_validacion", 30),
+        min_positivos_validacion=config.get("min_positivos_validacion", 10),
+        estricto=config.get("particion_estricta", False),
+    )
     if val_df.empty:
         raise DatosInsuficientesError("El conjunto de validación quedó vacío tras el split temporal y la purga por cliente.")
 
@@ -264,8 +281,8 @@ def entrenar() -> dict:
     y_val = val_df[target_col]
     if y_val.nunique() < 2:
         raise DatosInsuficientesError(
-            "El conjunto de validación quedó con una sola clase tras el split temporal y la purga por "
-            "cliente; no se puede calcular AUC/KS. Prueba con menos meses_validacion."
+            "El conjunto de validación quedó con una sola clase tras la partición agrupada por cliente; "
+            "no se puede calcular AUC/KS. Prueba con una prop_validacion mayor."
         )
 
     modelo = entrenar_regresion_logistica(x_train, y_train)
@@ -351,18 +368,32 @@ def entrenar() -> dict:
         except DatosInsuficientesError:
             pass
 
-    if ks < ks_minimo:
-        mensaje = f"KS de validación ({ks:.4f}) inferior al mínimo requerido ({ks_minimo}); modelo rechazado."
-        logger.error(mensaje)
-        raise ModeloRechazadoError(mensaje)
+    # Criterio de aceptación (src/ajustes_evaluacion.py:decidir_promocion):
+    # la validación cruzada agrupada por cliente gobierna (oof), calculada
+    # aquí de forma independiente de evaluar_modelo() —que necesita base de
+    # datos real y cuyo fallo nunca debe impedir la aceptación— para que la
+    # decisión siga siendo verificable sin conexión a SQL Server. El
+    # holdout temporal (ventana x_val/y_val, ya calculada arriba) solo veta,
+    # nunca promueve por sí solo.
+    def _ajustar_y_predecir(df_train, df_test):
+        x_train_fold, mapeo_fold = preparar_features(df_train, target_col=target_col)
+        x_test_fold = transformar_a_woe(df_test, mapeo_fold)
+        modelo_fold = entrenar_regresion_logistica(x_train_fold, df_train[target_col])
+        return modelo_fold.predict_proba(x_test_fold)[:, 1]
 
-    if auc > auc_maximo:
-        mensaje = (
-            f"AUC de validación ({auc:.4f}) supera el techo de sospecha de fuga ({auc_maximo}); "
-            "modelo rechazado. Revisar la construcción de las variables antes de reentrenar."
-        )
-        logger.error(mensaje)
-        raise ModeloRechazadoError(mensaje)
+    oof = metricas_fuera_de_muestra(
+        df,
+        ajustar_y_predecir=_ajustar_y_predecir,
+        target_col=target_col,
+        cliente_col=cliente_col,
+        n_particiones=config.get("n_particiones_crossval", 5),
+    )
+    holdout = {"auc": auc, "n_evaluados": len(y_val)}
+    cfg_decision = SimpleNamespace(train=SimpleNamespace(**config))
+    aceptado, motivo = decidir_promocion(oof, holdout, cfg_decision)
+    if not aceptado:
+        logger.error(motivo)
+        raise ModeloRechazadoError(motivo)
 
     scorecard = generar_scorecard(modelo, mapeo, list(x_train.columns))
     ruta_scorecard = _resolver_ruta("ruta_scorecard", "models/scorecard.csv")

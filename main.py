@@ -26,14 +26,16 @@ deriva de un conjunto que no superó los controles de calidad.
 """
 
 import argparse
+import csv
 import logging
 import sys
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 
 from src import calidad, drift, esquema, extract, monitor, rules, score, train, writeback
-from src.config import RAIZ_PROYECTO
+from src.config import RAIZ_PROYECTO, cargar_config
 
 LOGS_DIR = RAIZ_PROYECTO / "logs"
 LOGS_DIR.mkdir(exist_ok=True)
@@ -45,6 +47,19 @@ if not logger.handlers:
     _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logger.addHandler(_handler)
     logger.addHandler(logging.StreamHandler())
+
+
+TOTAL_ETAPAS_SCOREAR = 7
+
+
+def _reportar_progreso(indice: int, total: int, etapa: str) -> None:
+    """Protocolo mínimo de progreso para quien invoque este script como
+    subproceso (backend/src/services/scoring_runner.py): una línea por
+    etapa a STDOUT (nunca al logger, que va a stderr y mezclaría texto
+    humano con el marcador). `comando_scorear()` es el único comando
+    instrumentado hoy — es el único con una barra de progreso en el
+    frontend (pantalla "Scorear (simulación)")."""
+    print(f"PROGRESO {indice}/{total} {etapa}", flush=True)
 
 
 def _ejecutar_con_bitacora(nombre_comando: str, funcion) -> int:
@@ -144,10 +159,60 @@ def _construir_resultados_scoring(df_clientes: pd.DataFrame) -> tuple[pd.DataFra
                 "ClasificacionId": clasificacion_id,
                 "PlazoPagoRecomendadoId": plazo_id,
                 "Motivo": f"Actualización automática por modelo de scoring (segmento {segmento_codigo}, clasificación {clasificacion_codigo})",
+                # Códigos legibles (no solo los ids resueltos arriba): los usa
+                # comando_scorear() para el CSV de resultados de la
+                # simulación (barra de progreso + Excel, frontend), sin
+                # necesidad de otra consulta — writeback.guardar_resultados
+                # ignora cualquier columna que no use.
+                "SegmentoCodigo": segmento_codigo,
+                "ClasificacionCodigo": clasificacion_codigo,
             }
         )
 
     return pd.DataFrame(filas), clientes_en_revision
+
+
+def _guardar_csv_simulacion(
+    df_resultados: pd.DataFrame, df_clientes: pd.DataFrame, clientes_en_revision: list, reporte: dict
+) -> Path:
+    """Detalle por cliente de una simulación (scorear --dry-run): un
+    archivo nuevo por corrida (nombre con marca de tiempo, para que dos
+    simulaciones concurrentes no se pisen), pensado para la pantalla
+    "Scorear (simulación)" del frontend (barra de progreso + descarga de
+    Excel — ver RESULTADO_CSV en _reportar_progreso). Nunca se escribe
+    para la ejecución real: ahí dbo.ClienteRiesgoHistorial ya es la
+    fuente de verdad."""
+    marca_tiempo = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ruta = LOGS_DIR / f"simulacion_{marca_tiempo}.csv"
+    mapa_plazo_por_segmento = cargar_config().get("reglas", {}).get("plazo_por_segmento", {})
+    cambiaron = set(reporte["cambiaron_segmento"])
+    revision = set(clientes_en_revision)
+
+    with open(ruta, "w", newline="", encoding="utf-8") as f:
+        escritor = csv.writer(f)
+        escritor.writerow(
+            [
+                "ClienteId", "NombreCliente", "ScorePropuesto", "SegmentoPropuesto",
+                "ClasificacionPropuesta", "PlazoRecomendado", "CambiaSegmento", "RevisionManual",
+            ]
+        )
+        for _, fila in df_resultados.iterrows():
+            cliente_id = int(fila["ClienteId"])
+            nombre = df_clientes.at[cliente_id, "NombreCompleto"] if "NombreCompleto" in df_clientes.columns else ""
+            segmento_codigo = fila["SegmentoCodigo"]
+            escritor.writerow(
+                [
+                    cliente_id,
+                    nombre,
+                    fila["ScoreRiesgo"],
+                    segmento_codigo,
+                    fila["ClasificacionCodigo"],
+                    mapa_plazo_por_segmento.get(segmento_codigo, ""),
+                    "Sí" if cliente_id in cambiaron else "No",
+                    "Sí" if cliente_id in revision else "No",
+                ]
+            )
+    return ruta
 
 
 def comando_scorear(dry_run: bool, clientes_ids: list[int] | None = None) -> int:
@@ -174,7 +239,9 @@ def comando_scorear(dry_run: bool, clientes_ids: list[int] | None = None) -> int
     el mismo criterio que usan el entrenamiento y la cola de
     reevaluación (dbo.vw_HistorialClienteActual)."""
     esquema.validar_esquema()
+    _reportar_progreso(1, TOTAL_ETAPAS_SCOREAR, "Validando esquema de datos")
     calidad.validar_antes_de_entrenar()
+    _reportar_progreso(2, TOTAL_ETAPAS_SCOREAR, "Validando calidad de datos")
 
     df_clientes = extract.extraer_features()
     df_clientes = extract.agregar_historial_evaluable(df_clientes)
@@ -183,11 +250,23 @@ def comando_scorear(dry_run: bool, clientes_ids: list[int] | None = None) -> int
         if df_clientes.empty:
             logger.info("Reevaluación bajo demanda: ninguno de los %d ClienteId pedidos es evaluable ahora mismo.", len(clientes_ids))
             return 0
+    _reportar_progreso(3, TOTAL_ETAPAS_SCOREAR, "Extrayendo datos de clientes")
     scores = score.calcular_scores(df_clientes)
     combinado = df_clientes.join(scores)
+    _reportar_progreso(4, TOTAL_ETAPAS_SCOREAR, "Calculando scores del modelo")
 
     df_resultados, clientes_en_revision = _construir_resultados_scoring(combinado)
-    reporte = writeback.guardar_resultados(df_resultados, dry_run=dry_run)
+    _reportar_progreso(5, TOTAL_ETAPAS_SCOREAR, "Aplicando reglas de negocio")
+    # Detalle por variable (explicabilidad del score, sección 4.4.3 del
+    # manual técnico): solo tiene sentido calcularlo si de verdad se va a
+    # escribir — en dry_run no se guarda nada, sería trabajo descartado.
+    detalle_variables = score.construir_detalle_variables(df_clientes) if not dry_run else None
+    reporte = writeback.guardar_resultados(df_resultados, dry_run=dry_run, detalle_variables=detalle_variables)
+    _reportar_progreso(6, TOTAL_ETAPAS_SCOREAR, "Guardando resultados" if not dry_run else "Comparando segmentos propuestos")
+
+    if dry_run:
+        ruta_csv = _guardar_csv_simulacion(df_resultados, df_clientes, clientes_en_revision, reporte)
+        print(f"RESULTADO_CSV {ruta_csv.resolve()}", flush=True)
 
     logger.info(
         "Scoring (%s): %d cambiaron de segmento, %d sin cambios, %d fallidos, %d marcados para revisión manual.",
@@ -218,6 +297,7 @@ def comando_scorear(dry_run: bool, clientes_ids: list[int] | None = None) -> int
         # invalida un scoring que ya se ejecutó (o simuló) correctamente.
         logger.warning("No se pudo medir la deriva tras el scoring: %s", exc)
 
+    _reportar_progreso(7, TOTAL_ETAPAS_SCOREAR, "Midiendo deriva de datos")
     return reporte["total"]
 
 

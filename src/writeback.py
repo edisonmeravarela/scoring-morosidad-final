@@ -57,12 +57,66 @@ def _ejecutar_sp(conn, cliente_id: int, score: float, segmento_id: int, clasific
     )
 
 
+def _ultimo_historial_por_cliente(cliente_ids: list[int]) -> dict[int, int]:
+    """HistorialId más reciente de dbo.ClienteRiesgoHistorial por cliente,
+    ANTES de ejecutar el lote — permite detectar, por comparación, cuál
+    cliente recibió una fila nueva (sp_ActualizarScoringCliente inserta en
+    ClienteRiesgoHistorial solo si cambia segmento o clasificación, y no
+    expone el HistorialId generado; no se usa OUTPUT porque el INSERT
+    ocurre dentro del procedimiento, no aquí)."""
+    if not cliente_ids:
+        return {}
+    marcadores = ", ".join(str(int(c)) for c in cliente_ids)
+    df = read_sql(
+        f"SELECT ClienteId, MAX(HistorialId) AS UltimoId FROM dbo.ClienteRiesgoHistorial "
+        f"WHERE ClienteId IN ({marcadores}) GROUP BY ClienteId"
+    )
+    return dict(zip(df["ClienteId"], df["UltimoId"]))
+
+
+def _historial_actual(conn, cliente_id: int) -> int:
+    """HistorialId más reciente del cliente DESPUÉS del EXEC, en la misma
+    transacción — comparado contra _ultimo_historial_por_cliente() para
+    saber si sp_ActualizarScoringCliente insertó una fila nueva."""
+    return conn.exec_driver_sql(
+        "SELECT ISNULL(MAX(HistorialId), 0) FROM dbo.ClienteRiesgoHistorial WHERE ClienteId = ?",
+        (cliente_id,),
+    ).scalar()
+
+
+def _insertar_detalle_variables(conn, historial_id: int, filas: list[dict]) -> None:
+    """Persiste el desglose por variable (score.construir_detalle_variables)
+    de una fila de ClienteRiesgoHistorial recién creada — ver
+    dbo.ScoringDetalleVariable en database/schema_dbo.sql."""
+    for f in filas:
+        conn.exec_driver_sql(
+            "INSERT INTO dbo.ScoringDetalleVariable "
+            "(HistorialId, Variable, Etiqueta, ValorOriginal, WOE, Puntos, Orden) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                historial_id,
+                f["Variable"],
+                f["Etiqueta"],
+                None if f["ValorOriginal"] is None else str(f["ValorOriginal"]),
+                f["WOE"],
+                f["Puntos"],
+                f["Orden"],
+            ),
+        )
+
+
 def _valor_opcional(fila: pd.Series, columna: str):
     valor = fila.get(columna)
     return None if pd.isna(valor) else valor
 
 
-def guardar_resultados(df: pd.DataFrame, dry_run: bool = False, usuario_id: int | None = None, tamano_lote: int | None = None) -> dict:
+def guardar_resultados(
+    df: pd.DataFrame,
+    dry_run: bool = False,
+    usuario_id: int | None = None,
+    tamano_lote: int | None = None,
+    detalle_variables: dict[int, list[dict]] | None = None,
+) -> dict:
     """Recorre `df` (columna o índice ClienteId; columnas ScoreRiesgo,
     SegmentoRiesgoId, ClasificacionId, PlazoPagoRecomendadoId y,
     opcionalmente, Motivo) y ejecuta dbo.sp_ActualizarScoringCliente por
@@ -72,7 +126,13 @@ def guardar_resultados(df: pd.DataFrame, dry_run: bool = False, usuario_id: int 
 
     En modo simulación (dry_run=True) no ejecuta ningún UPDATE: solo
     compara el SegmentoRiesgoId propuesto contra el vigente en base de
-    datos para construir el mismo reporte de cambios."""
+    datos para construir el mismo reporte de cambios.
+
+    `detalle_variables`, si se indica (score.construir_detalle_variables()),
+    persiste en dbo.ScoringDetalleVariable el desglose por variable de cada
+    cliente — pero solo para los que de verdad recibieron una fila nueva en
+    dbo.ClienteRiesgoHistorial (detectado comparando el HistorialId antes/
+    después de cada EXEC, en la misma transacción); nunca en dry_run."""
     if df.index.name == "ClienteId":
         df = df.reset_index()
 
@@ -81,6 +141,7 @@ def guardar_resultados(df: pd.DataFrame, dry_run: bool = False, usuario_id: int 
     motivo_por_defecto = config.get("motivo_por_defecto", "Actualización automática por modelo de scoring")
 
     segmento_vigente = _segmento_actual_por_cliente(df["ClienteId"].tolist())
+    historial_vigente = _ultimo_historial_por_cliente(df["ClienteId"].tolist()) if detalle_variables else {}
 
     cambiaron, sin_cambios, fallidos = [], [], []
     engine = get_engine()
@@ -111,6 +172,10 @@ def guardar_resultados(df: pd.DataFrame, dry_run: bool = False, usuario_id: int 
                     )
                     cambia = segmento_vigente.get(cliente_id) != int(fila["SegmentoRiesgoId"])
                     (cambiaron if cambia else sin_cambios).append(cliente_id)
+                    if detalle_variables and cliente_id in detalle_variables:
+                        nuevo_historial_id = _historial_actual(conn, cliente_id)
+                        if nuevo_historial_id > historial_vigente.get(cliente_id, 0):
+                            _insertar_detalle_variables(conn, nuevo_historial_id, detalle_variables[cliente_id])
                 except Exception as exc:
                     logger.error("Falló la actualización del cliente %d: %s", cliente_id, exc)
                     fallidos.append(cliente_id)

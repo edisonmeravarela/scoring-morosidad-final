@@ -108,3 +108,140 @@ def test_calcular_scores_con_modelo_real_es_reproducible():
     assert list(resultado_1.index) == list(df_clientes.index)
     assert resultado_1["probabilidad_incumplimiento"].between(0.0, 1.0).all()
     assert resultado_1["score"].between(0, 1000).all()
+
+
+# ---------- construir_detalle_variables ----------
+
+
+class _ModeloLinealFalso:
+    """Doble mínimo de LogisticRegression: solo expone coef_/intercept_,
+    que es todo lo que construir_detalle_variables necesita (nunca llama a
+    predict_proba/decision_function)."""
+
+    def __init__(self, coef: list[float], intercept: float):
+        self.coef_ = np.array([coef])
+        self.intercept_ = np.array([intercept])
+
+
+def test_construir_detalle_variables_incluye_fila_base_y_una_fila_por_variable(monkeypatch):
+    target = pd.Series([0, 0, 0, 1, 1, 1, 0, 1])
+    var_a = pd.Series([1, 2, 3, 8, 9, 10, 2, 9])
+    mapeo = {"VarModeloA": features.calcular_woe_variable(var_a, target, n_tramos=2)}
+    columnas = ["VarModeloA"]
+    bundle = {"modelo": _ModeloLinealFalso([-0.5], 0.1), "mapeo": mapeo, "columnas": columnas}
+    monkeypatch.setattr(score, "cargar_modelo", lambda ruta_modelo=None: bundle)
+    monkeypatch.setattr(score, "_config_score", lambda: {"mapa_variables_inferencia": {}})
+
+    df_cliente = pd.DataFrame({"VarModeloA": [1, 9]}, index=pd.Index([101, 102], name="ClienteId"))
+    detalle = score.construir_detalle_variables(df_cliente)
+
+    assert set(detalle.keys()) == {101, 102}
+    filas_101 = detalle[101]
+    assert len(filas_101) == 2  # "(base)" + VarModeloA
+    factor, offset = score.factor_offset()
+    assert filas_101[0] == {
+        "Variable": "(base)",
+        "Etiqueta": "Puntaje base",
+        "ValorOriginal": None,
+        "WOE": None,
+        "Puntos": round(offset - factor * 0.1, 3),
+        "Orden": 0,
+    }
+    fila_variable = filas_101[1]
+    assert fila_variable["Variable"] == "VarModeloA"
+    assert fila_variable["ValorOriginal"] == 1  # mismo nombre en df: sin traducción
+    assert fila_variable["Orden"] == 1
+
+
+def test_construir_detalle_variables_puntos_siguen_la_formula_del_scorecard(monkeypatch):
+    """puntos = -factor * beta * woe (misma fórmula que
+    train.generar_scorecard usa por tramo, aquí con el WOE real del
+    cliente) y la fila "(base)" = offset - factor*intercept — exactamente
+    el criterio que train.py ya documenta como "auditable, no es una caja
+    negra"."""
+    bundle = {
+        "modelo": _ModeloLinealFalso([2.0, -1.0], 0.5),
+        "mapeo": {},
+        "columnas": ["VarA", "VarB"],
+    }
+    monkeypatch.setattr(score, "cargar_modelo", lambda ruta_modelo=None: bundle)
+    monkeypatch.setattr(score, "_config_score", lambda: {"mapa_variables_inferencia": {}})
+    monkeypatch.setattr(
+        score,
+        "_construir_features_inferencia",
+        lambda df, mapeo, columnas: pd.DataFrame({"VarA": [1.5], "VarB": [-2.0]}, index=df.index),
+    )
+
+    df_cliente = pd.DataFrame({"VarA": [10], "VarB": [20]}, index=pd.Index([1], name="ClienteId"))
+    detalle = score.construir_detalle_variables(df_cliente)
+
+    factor, offset = score.factor_offset()
+    filas = {f["Variable"]: f for f in detalle[1]}
+    assert filas["(base)"]["Puntos"] == round(offset - factor * 0.5, 3)
+    assert filas["VarA"]["Puntos"] == round(-factor * 2.0 * 1.5, 3)
+    assert filas["VarB"]["Puntos"] == round(-factor * -1.0 * -2.0, 3)
+    # orden por |puntos| descendente (la fila base siempre va primero, Orden 0)
+    assert [f["Orden"] for f in detalle[1]] == [0, 1, 2]
+    assert abs(filas["VarA"]["Puntos"]) >= abs(filas["VarB"]["Puntos"])
+
+
+def test_construir_detalle_variables_valor_original_none_sin_equivalente_de_cliente(monkeypatch):
+    """Las variables de entrenamiento sin equivalente a nivel de cliente
+    (mapa_variables_inferencia: null) quedan en WOE=0/Puntos=0 (ver
+    _construir_features_inferencia) y aquí, además, con ValorOriginal=None
+    — no existe un valor crudo que mostrar."""
+    bundle = {
+        "modelo": _ModeloLinealFalso([1.0], 0.0),
+        "mapeo": {},
+        "columnas": ["VendedorId"],
+    }
+    monkeypatch.setattr(score, "cargar_modelo", lambda ruta_modelo=None: bundle)
+    monkeypatch.setattr(score, "_config_score", lambda: {"mapa_variables_inferencia": {"VendedorId": None}})
+
+    df_cliente = pd.DataFrame({"CiudadId": [1]}, index=pd.Index([1], name="ClienteId"))
+    detalle = score.construir_detalle_variables(df_cliente)
+
+    fila = [f for f in detalle[1] if f["Variable"] == "VendedorId"][0]
+    assert fila["ValorOriginal"] is None
+    assert fila["WOE"] == 0.0
+    assert fila["Puntos"] == 0.0
+
+
+def test_construir_detalle_variables_no_deja_tipos_numpy_en_el_resultado(monkeypatch):
+    """modelo.coef_/intercept_/df.at[...] son tipos numpy (np.float64,
+    np.int64) — sin convertirlos a tipos nativos de Python, pyodbc puede no
+    bindearlos igual que un float/int normal al insertar (writeback.py).
+    Esta prueba fija ese contrato con un modelo "real" (numpy real, no un
+    doble con floats de Python a mano)."""
+    target = pd.Series([0, 0, 0, 1, 1, 1, 0, 1])
+    var_a = pd.Series([1, 2, 3, 8, 9, 10, 2, 9])
+    mapeo = {"VarModeloA": features.calcular_woe_variable(var_a, target, n_tramos=2)}
+    columnas = ["VarModeloA"]
+    x_entrenamiento = features.transformar_a_woe(pd.DataFrame({"VarModeloA": var_a}), mapeo)
+    modelo_real = LogisticRegression().fit(x_entrenamiento, target)  # coef_/intercept_ son np.float64
+
+    bundle = {"modelo": modelo_real, "mapeo": mapeo, "columnas": columnas}
+    monkeypatch.setattr(score, "cargar_modelo", lambda ruta_modelo=None: bundle)
+    monkeypatch.setattr(score, "_config_score", lambda: {"mapa_variables_inferencia": {}})
+
+    df_cliente = pd.DataFrame({"VarModeloA": [1]}, index=pd.Index([1], name="ClienteId"))
+    detalle = score.construir_detalle_variables(df_cliente)
+
+    for fila in detalle[1]:
+        assert fila["Puntos"] is None or type(fila["Puntos"]) is float
+        assert fila["WOE"] is None or type(fila["WOE"]) is float
+        assert fila["ValorOriginal"] is None or type(fila["ValorOriginal"]) in (int, float)
+
+
+def test_construir_detalle_variables_con_modelo_real_la_suma_de_puntos_reproduce_el_score():
+    # Verificación en vivo: la suma de "Puntos" de todas las filas (incluida
+    # la base) debe reproducir el score de calcular_scores() para el mismo
+    # cliente, salvo el margen de redondeo (±1) que introduce el score_min/
+    # score_max/round() final de calcular_scores.
+    df_clientes = extract.extraer_features()
+    scores = score.calcular_scores(df_clientes)
+    detalle = score.construir_detalle_variables(df_clientes)
+
+    for cliente_id in df_clientes.index[:5]:
+        suma_puntos = sum(f["Puntos"] for f in detalle[cliente_id])
+        assert abs(suma_puntos - scores.loc[cliente_id, "score"]) <= 1.0

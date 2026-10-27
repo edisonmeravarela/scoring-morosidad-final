@@ -78,6 +78,7 @@ def _config_entrenamiento_prueba(**overrides) -> dict:
         "class_weight": "balanced",
         "entrenar_xgboost": False,
         "ks_minimo": 0.0,
+        "auc_minimo": 0.0,
         "auc_maximo_sospechoso": 0.95,
         "score_base": 600,
         "odds_base": 50,

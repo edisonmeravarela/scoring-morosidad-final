@@ -1,4 +1,6 @@
+import csv
 import logging
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -18,12 +20,16 @@ def _aislar_controles_scorear(monkeypatch) -> None:
     extract.agregar_historial_evaluable (de lo contrario haría una
     consulta real contra dbo.vw_HistorialClienteActual incluso en estas
     pruebas unitarias, que no necesitan ese dato porque además mockean
-    rules.aplicar_overrides/clasificar_cliente directamente)."""
+    rules.aplicar_overrides/clasificar_cliente directamente). También aísla
+    score.construir_detalle_variables (de lo contrario cargaría el modelo
+    real de disco en cada prueba unitaria de comando_scorear, igual motivo
+    que agregar_historial_evaluable)."""
     monkeypatch.setattr(esquema, "validar_esquema", lambda: {"Criticos": 0, "Advertencias": 0})
     monkeypatch.setattr(calidad, "validar_antes_de_entrenar", lambda: _veredicto_calidad_ok())
     monkeypatch.setattr(train, "cargar_modelo", lambda: {"mapeo": {}, "version_modelo": "v-prueba"})
     monkeypatch.setattr(drift, "medir_deriva", lambda *a, **k: pd.DataFrame())
     monkeypatch.setattr(extract, "agregar_historial_evaluable", lambda df: df)
+    monkeypatch.setattr(score, "construir_detalle_variables", lambda df: {})
 
 
 # ---------- construir_parser ----------
@@ -118,8 +124,9 @@ def _fila_cliente_prueba():
     )
 
 
-def test_comando_scorear_arma_resultados_y_delega_en_writeback(monkeypatch):
+def test_comando_scorear_arma_resultados_y_delega_en_writeback(monkeypatch, tmp_path, capsys):
     _aislar_controles_scorear(monkeypatch)
+    monkeypatch.setattr(main, "LOGS_DIR", tmp_path)  # no escribir en scoring-morosidad/logs/ real
     df_clientes = pd.DataFrame([_fila_cliente_prueba().drop("score")], index=pd.Index([1], name="ClienteId"))
     monkeypatch.setattr(extract, "extraer_features", lambda: df_clientes)
     monkeypatch.setattr(score, "calcular_scores", lambda df: pd.DataFrame({"score": [415.0]}, index=df.index))
@@ -153,8 +160,87 @@ def test_comando_scorear_arma_resultados_y_delega_en_writeback(monkeypatch):
     assert fila["PlazoPagoRecomendadoId"] == 2
     assert "ALTO" in fila["Motivo"]
 
+    # Protocolo de progreso (barra de progreso del frontend, pantalla
+    # "Scorear (simulación)"): 7 líneas PROGRESO en orden, a stdout, más
+    # RESULTADO_CSV porque esta corrida es dry_run=True.
+    salida = capsys.readouterr().out
+    lineas_progreso = [l for l in salida.splitlines() if l.startswith("PROGRESO ")]
+    assert lineas_progreso == [
+        "PROGRESO 1/7 Validando esquema de datos",
+        "PROGRESO 2/7 Validando calidad de datos",
+        "PROGRESO 3/7 Extrayendo datos de clientes",
+        "PROGRESO 4/7 Calculando scores del modelo",
+        "PROGRESO 5/7 Aplicando reglas de negocio",
+        "PROGRESO 6/7 Comparando segmentos propuestos",
+        "PROGRESO 7/7 Midiendo deriva de datos",
+    ]
+    lineas_csv = [l for l in salida.splitlines() if l.startswith("RESULTADO_CSV ")]
+    assert len(lineas_csv) == 1
+    ruta_csv = Path(lineas_csv[0].split(" ", 1)[1])
+    assert ruta_csv.exists()
+    assert ruta_csv.parent == tmp_path
 
-def test_comando_scorear_incorpora_el_historial_evaluable_antes_de_las_reglas(monkeypatch):
+
+def test_comando_scorear_dry_run_escribe_el_csv_con_el_detalle_por_cliente(monkeypatch, tmp_path):
+    """El CSV de la pantalla "Scorear (simulación)" (barra de progreso +
+    descarga de Excel, frontend): una fila por cliente, con el nombre, el
+    código de segmento/clasificación propuestos, el plazo recomendado
+    (resuelto desde config.reglas.plazo_por_segmento, sin tocar la base) y
+    si cambia de segmento (comparado contra reporte["cambiaron_segmento"],
+    que ya devuelve writeback.guardar_resultados)."""
+    _aislar_controles_scorear(monkeypatch)
+    monkeypatch.setattr(main, "LOGS_DIR", tmp_path)
+    df_clientes = pd.DataFrame(
+        [
+            {**_fila_cliente_prueba().drop("score"), "NombreCompleto": "Cliente Uno"},
+            {**_fila_cliente_prueba().drop("score"), "NombreCompleto": "Cliente Dos"},
+        ],
+        index=pd.Index([1, 2], name="ClienteId"),
+    )
+    monkeypatch.setattr(extract, "extraer_features", lambda: df_clientes)
+    monkeypatch.setattr(score, "calcular_scores", lambda df: pd.DataFrame({"score": [415.0, 900.0]}, index=df.index))
+    monkeypatch.setattr(rules, "asignar_segmento", lambda s: 3 if s < 500 else 1)
+    monkeypatch.setattr(rules, "aplicar_overrides", lambda cliente, seg_id: "ALTO" if seg_id == 3 else "BAJO")
+    monkeypatch.setattr(rules, "resolver_segmento_final", lambda seg_id, codigo: seg_id)
+    monkeypatch.setattr(rules, "recomendar_plazo", lambda codigo: 2)
+    monkeypatch.setattr(rules, "clasificar_cliente", lambda cliente: "B")
+    monkeypatch.setattr(rules, "resolver_clasificacion_id", lambda codigo: 2)
+    monkeypatch.setattr(rules, "marcar_revision", lambda cliente, codigo: codigo == "ALTO")
+    monkeypatch.setattr(
+        main,
+        "cargar_config",
+        lambda: {"reglas": {"plazo_por_segmento": {"ALTO": "15 DÍAS", "BAJO": "60 DÍAS"}}},
+    )
+    monkeypatch.setattr(
+        writeback,
+        "guardar_resultados",
+        lambda df, dry_run=False, **k: {
+            "modo": "simulacion", "total": len(df),
+            "cambiaron_segmento": [1], "sin_cambios": [2], "fallidos": [],
+        },
+    )
+
+    main.comando_scorear(dry_run=True)
+
+    (ruta_csv,) = list(tmp_path.glob("simulacion_*.csv"))
+    with open(ruta_csv, encoding="utf-8") as f:
+        filas = list(csv.DictReader(f))
+
+    assert [f["ClienteId"] for f in filas] == ["1", "2"]
+    fila_1, fila_2 = filas
+    assert fila_1["NombreCliente"] == "Cliente Uno"
+    assert fila_1["SegmentoPropuesto"] == "ALTO"
+    assert fila_1["PlazoRecomendado"] == "15 DÍAS"
+    assert fila_1["CambiaSegmento"] == "Sí"
+    assert fila_1["RevisionManual"] == "Sí"
+    assert fila_2["NombreCliente"] == "Cliente Dos"
+    assert fila_2["SegmentoPropuesto"] == "BAJO"
+    assert fila_2["PlazoRecomendado"] == "60 DÍAS"
+    assert fila_2["CambiaSegmento"] == "No"
+    assert fila_2["RevisionManual"] == "No"
+
+
+def test_comando_scorear_incorpora_el_historial_evaluable_antes_de_las_reglas(monkeypatch, capsys):
     """Confirma que comando_scorear llama a
     extract.agregar_historial_evaluable (criterio único de "historial
     evaluable" compartido con el entrenamiento y la cola de reevaluación
@@ -179,6 +265,87 @@ def test_comando_scorear_incorpora_el_historial_evaluable_antes_de_las_reglas(mo
 
     assert len(llamadas) == 1
     assert list(llamadas[0].index) == [1]
+
+    # La ejecución real nunca escribe el CSV de simulación (la base de
+    # datos ya es la fuente de verdad ahí) ni imprime RESULTADO_CSV.
+    salida = capsys.readouterr().out
+    assert not any(l.startswith("RESULTADO_CSV ") for l in salida.splitlines())
+
+
+def test_comando_scorear_calcula_y_pasa_el_detalle_de_variables_a_writeback(monkeypatch):
+    """Explicabilidad del score (sección 4.4.3 del manual técnico):
+    comando_scorear debe llamar a score.construir_detalle_variables con la
+    misma población que llega a calcular_scores, y pasar el resultado a
+    writeback.guardar_resultados — pero solo cuando no es dry_run (en
+    simulación no se escribe nada, calcularlo sería trabajo descartado)."""
+    _aislar_controles_scorear(monkeypatch)
+    df_clientes = pd.DataFrame([_fila_cliente_prueba().drop("score")], index=pd.Index([1], name="ClienteId"))
+    monkeypatch.setattr(extract, "extraer_features", lambda: df_clientes)
+    monkeypatch.setattr(score, "calcular_scores", lambda df: pd.DataFrame({"score": [415.0]}, index=df.index))
+    monkeypatch.setattr(rules, "asignar_segmento", lambda s: 3)
+    monkeypatch.setattr(rules, "aplicar_overrides", lambda cliente, seg_id: "ALTO")
+    monkeypatch.setattr(rules, "resolver_segmento_final", lambda seg_id, codigo: 3)
+    monkeypatch.setattr(rules, "recomendar_plazo", lambda codigo: 2)
+    monkeypatch.setattr(rules, "clasificar_cliente", lambda cliente: "B")
+    monkeypatch.setattr(rules, "resolver_clasificacion_id", lambda codigo: 2)
+    monkeypatch.setattr(rules, "marcar_revision", lambda cliente, codigo: False)
+
+    llamadas_detalle = []
+
+    def _detalle_falso(df):
+        llamadas_detalle.append(df)
+        return {1: [{"Variable": "(base)", "Etiqueta": "Puntaje base", "ValorOriginal": None, "WOE": None, "Puntos": 600.0, "Orden": 0}]}
+
+    monkeypatch.setattr(score, "construir_detalle_variables", _detalle_falso)
+
+    llamadas_writeback = {}
+
+    def _guardar_resultados_falso(df, dry_run=False, detalle_variables=None, **kwargs):
+        llamadas_writeback["detalle_variables"] = detalle_variables
+        return {"modo": "real", "total": len(df), "cambiaron_segmento": [1], "sin_cambios": [], "fallidos": []}
+
+    monkeypatch.setattr(writeback, "guardar_resultados", _guardar_resultados_falso)
+
+    main.comando_scorear(dry_run=False)
+
+    assert len(llamadas_detalle) == 1
+    assert list(llamadas_detalle[0].index) == [1]
+    assert llamadas_writeback["detalle_variables"] == {
+        1: [{"Variable": "(base)", "Etiqueta": "Puntaje base", "ValorOriginal": None, "WOE": None, "Puntos": 600.0, "Orden": 0}]
+    }
+
+
+def test_comando_scorear_en_dry_run_no_calcula_el_detalle_de_variables(monkeypatch, tmp_path):
+    """En simulación no se escribe nada: calcular el detalle sería trabajo
+    descartado, así que comando_scorear no debe llamarlo."""
+    _aislar_controles_scorear(monkeypatch)
+    monkeypatch.setattr(main, "LOGS_DIR", tmp_path)  # no escribir en scoring-morosidad/logs/ real
+    df_clientes = pd.DataFrame([_fila_cliente_prueba().drop("score")], index=pd.Index([1], name="ClienteId"))
+    monkeypatch.setattr(extract, "extraer_features", lambda: df_clientes)
+    monkeypatch.setattr(score, "calcular_scores", lambda df: pd.DataFrame({"score": [415.0]}, index=df.index))
+    monkeypatch.setattr(rules, "asignar_segmento", lambda s: 3)
+    monkeypatch.setattr(rules, "aplicar_overrides", lambda cliente, seg_id: "ALTO")
+    monkeypatch.setattr(rules, "resolver_segmento_final", lambda seg_id, codigo: 3)
+    monkeypatch.setattr(rules, "recomendar_plazo", lambda codigo: 2)
+    monkeypatch.setattr(rules, "clasificar_cliente", lambda cliente: "B")
+    monkeypatch.setattr(rules, "resolver_clasificacion_id", lambda codigo: 2)
+    monkeypatch.setattr(rules, "marcar_revision", lambda cliente, codigo: False)
+
+    llamadas_detalle = []
+    monkeypatch.setattr(score, "construir_detalle_variables", lambda df: (llamadas_detalle.append(df) or {}))
+
+    llamadas_writeback = {}
+
+    def _guardar_resultados_falso(df, dry_run=False, detalle_variables=None, **kwargs):
+        llamadas_writeback["detalle_variables"] = detalle_variables
+        return {"modo": "simulacion", "total": len(df), "cambiaron_segmento": [], "sin_cambios": [1], "fallidos": []}
+
+    monkeypatch.setattr(writeback, "guardar_resultados", _guardar_resultados_falso)
+
+    main.comando_scorear(dry_run=True)
+
+    assert llamadas_detalle == []
+    assert llamadas_writeback["detalle_variables"] is None
 
 
 def test_comando_scorear_con_clientes_ids_filtra_la_poblacion(monkeypatch):
@@ -389,8 +556,26 @@ def test_main_scorear_dry_run_pipeline_completo_contra_datos_reales():
     # Primera vez que se ejecutan encadenados extract -> score -> rules ->
     # writeback tal como haría una ejecución real, sobre los ~169 clientes
     # reales. --dry-run garantiza que no se escribe nada.
+    antes = set(main.LOGS_DIR.glob("simulacion_*.csv"))
     codigo = main.main(["scorear", "--dry-run"])
     assert codigo == 0
+
+    # CSV de la pantalla "Scorear (simulación)" (barra de progreso +
+    # descarga de Excel, frontend): confirma que el pipeline real produce
+    # el archivo, con una fila por cliente evaluado. Se borra al terminar
+    # para no acumular artefactos de prueba en scoring-morosidad/logs/
+    # (logs/*.csv ya está en .gitignore, pero no hay motivo para dejarlo).
+    (ruta_csv,) = set(main.LOGS_DIR.glob("simulacion_*.csv")) - antes
+    try:
+        with open(ruta_csv, encoding="utf-8") as f:
+            filas = list(csv.DictReader(f))
+        assert len(filas) > 0
+        assert set(filas[0]) == {
+            "ClienteId", "NombreCliente", "ScorePropuesto", "SegmentoPropuesto",
+            "ClasificacionPropuesta", "PlazoRecomendado", "CambiaSegmento", "RevisionManual",
+        }
+    finally:
+        ruta_csv.unlink()
 
 
 def test_main_monitorear_no_falla_con_datos_reales():

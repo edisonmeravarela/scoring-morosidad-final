@@ -238,10 +238,38 @@ def evaluar_modelo(
     umbral = obtener_umbral_operativo()
 
     proba_val = modelo.predict_proba(x_val)[:, 1]
-    auc = float(roc_auc_score(y_val, proba_val))
     from src.train import calcular_ks  # import diferido: evita el ciclo evaluacion<->train
 
-    ks = calcular_ks(y_val, proba_val)
+    # KS/AUC: preferir el acumulado fuera de muestra de la validación
+    # cruzada agrupada (src/ajustes_evaluacion.py:metricas_fuera_de_muestra)
+    # sobre la ventana de validación — antes convivían un AUC de la ventana
+    # (pocas filas) con VP/FP/FN/VN de la validación cruzada, dos
+    # poblaciones distintas en la misma fila de resultados. Si no se puede
+    # calcular (p. ej. df_cv vacío o sin ambas clases), se usa la ventana
+    # como respaldo — nunca debe impedir el registro de esta fila.
+    auc_ventana = float(roc_auc_score(y_val, proba_val))
+    ks_ventana = calcular_ks(y_val, proba_val)
+    try:
+        from src.ajustes_evaluacion import metricas_fuera_de_muestra
+        from src.features import preparar_features, transformar_a_woe
+
+        def _ajustar_y_predecir(df_train, df_test):
+            x_train_fold, mapeo_fold = preparar_features(df_train, target_col=target_col)
+            x_test_fold = transformar_a_woe(df_test, mapeo_fold)
+            modelo_fold = entrenador_cv(x_train_fold, df_train[target_col])
+            return modelo_fold.predict_proba(x_test_fold)[:, 1]
+
+        oof = metricas_fuera_de_muestra(
+            df_cv, ajustar_y_predecir=_ajustar_y_predecir,
+            target_col=target_col, cliente_col=cliente_col, n_particiones=n_splits_cv,
+        )
+        auc, ks = oof["auc"], oof["ks"]
+    except Exception as exc:
+        logger.warning(
+            "No se pudo calcular KS/AUC fuera de muestra para %s/%s (%s); se usa la ventana de validación.",
+            version_modelo, alternativa, exc,
+        )
+        auc, ks = auc_ventana, ks_ventana
 
     score_val = _score_desde_proba(proba_val, factor, offset, score_min, score_max)
     conteos_val = matriz_confusion(y_val, score_val <= umbral)

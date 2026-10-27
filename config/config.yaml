@@ -75,14 +75,31 @@ entrenamiento:
   # cualquier cliente que caiga en ambos lados se purga de validación
   # (sección 4.4, "Agrupación por cliente"): un mismo cliente no debe
   # aparecer en entrenamiento y validación a la vez.
-  meses_validacion: 6
+  # meses_validacion: 6  # reemplazado por prop_validacion (dividir_particion_agrupada, src/ajustes_evaluacion.py); se deja comentado por si hay que volver atrás
   class_weight: "balanced"
   entrenar_xgboost: true
-  # Criterios de aceptación del paso 8.5: KS mínimo de validación, y el
-  # "test de fuga" — detener el entrenamiento si el AUC de validación
-  # supera este techo, porque en scoring crediticio real 0.75–0.85 es un
-  # buen modelo y ~0.98 casi siempre significa que algo se filtró.
+  # Partición 80/20 agrupada por cliente (src/ajustes_evaluacion.py:
+  # dividir_particion_agrupada): corrige que la purga por cliente del split
+  # temporal pudiera dejar la ventana de validación con muy pocas filas
+  # (no estimable) cuando la cartera está concentrada en pocos clientes
+  # recientes.
+  prop_validacion: 0.20
+  min_filas_validacion: 30
+  min_positivos_validacion: 10
+  particion_estricta: false      # true = aborta si la partición no alcanza el mínimo; false = avisa y sigue solo con validación cruzada
+  # Número de particiones de la validación cruzada agrupada por cliente,
+  # tanto para los conteos VP/FP/FN/VN (evaluacion.evaluar_validacion_cruzada,
+  # ya existente) como para KS/AUC fuera de muestra (src/ajustes_evaluacion.py:
+  # metricas_fuera_de_muestra) — misma partición conceptual para ambos.
+  n_particiones_crossval: 5
+  # Criterios de aceptación del paso 8.5: KS mínimo y AUC mínimo de la
+  # validación cruzada fuera de muestra (antes solo se exigía un techo de
+  # AUC: un modelo con AUC 0,25 —que ordena al revés— pasaba el filtro),
+  # y el "test de fuga" — techo de AUC, porque en scoring crediticio real
+  # 0.75–0.85 es un buen modelo y ~0.98 casi siempre significa que algo se
+  # filtró.
   ks_minimo: 0.25
+  auc_minimo: 0.60
   auc_maximo_sospechoso: 0.95
   # Escalado del score tipo FICO: score = offset + factor * ln(odds_bueno).
   # Anclas arbitrarias mientras no haya tasa de mora observada para
