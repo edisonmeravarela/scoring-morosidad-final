@@ -6,7 +6,7 @@ import pandas as pd
 import pytest
 
 import main
-from src import calidad, drift, esquema, extract, monitor, rules, score, train, writeback
+from src import calidad, db, drift, esquema, extract, monitor, rules, score, train, writeback
 
 
 def _veredicto_calidad_ok() -> dict:
@@ -547,6 +547,45 @@ def test_comando_monitorear_suma_observaciones_y_variables(monkeypatch):
     monkeypatch.setattr(monitor, "detectar_drift", lambda: pd.DataFrame({"variable": ["A"], "psi": [0.1], "alerta": [False]}))
 
     assert main.comando_monitorear() == 26
+
+
+# ---------- comando_calibrar ----------
+
+
+def test_parser_calibrar():
+    args = main.construir_parser().parse_args(["calibrar"])
+    assert args.comando == "calibrar"
+
+
+def test_evaluacion_id_servida_devuelve_el_id(monkeypatch):
+    monkeypatch.setattr(db, "consultar_escalar", lambda *a, **k: 105)
+    assert main._evaluacion_id_servida() == 105
+
+
+def test_evaluacion_id_servida_sin_modelo_servido_lanza(monkeypatch):
+    monkeypatch.setattr(db, "consultar_escalar", lambda *a, **k: None)
+    with pytest.raises(RuntimeError, match="EsModeloServido"):
+        main._evaluacion_id_servida()
+
+
+def test_comando_calibrar_resuelve_evaluacion_id_y_delega(monkeypatch):
+    import reporte_calibracion as repcal
+
+    llamadas = []
+
+    def _fake_ejecutar(evaluacion_id, **kwargs):
+        llamadas.append((evaluacion_id, kwargs))
+        return {
+            "resultados": {"crossval": {"n": 197}, "ventana": {"n": 40}},
+            "calibrador_principal": "NINGUNO",
+            "calibrador_guardado": None,
+        }
+
+    monkeypatch.setattr(db, "consultar_escalar", lambda *a, **k: 105)
+    monkeypatch.setattr(repcal, "ejecutar_calibracion_definitiva", _fake_ejecutar)
+
+    assert main.comando_calibrar() == 237  # 197 + 40
+    assert llamadas == [(105, {"persistir": True, "aplicar": True})]
 
 
 # ---------- Verificación en vivo: pipeline completo ensamblado por primera vez ----------

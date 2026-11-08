@@ -512,6 +512,10 @@ def entrenar() -> dict:
         n_particiones=config.get("n_particiones_crossval", 5),
     )
     holdout = {"auc": auc, "n_evaluados": len(y_val)}
+    logger.info(
+        "Fuera de muestra (gobierna la aceptación): AUC=%.4f, KS=%.4f sobre %d casos, %d particiones válidas.",
+        oof["auc"], oof["ks"], oof["n_evaluados"], oof["n_particiones_validas"],
+    )
     cfg_decision = SimpleNamespace(train=SimpleNamespace(**config))
     aceptado_ks_auc, motivo_ks_auc = modelo_aceptado(oof["ks"], oof["auc"], umbrales)
     aceptado, motivo = decidir_promocion(oof, holdout, cfg_decision, aceptado_ks_auc, motivo_ks_auc)
