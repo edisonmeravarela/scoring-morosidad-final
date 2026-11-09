@@ -172,7 +172,7 @@ def test_comando_scorear_arma_resultados_y_delega_en_writeback(monkeypatch, tmp_
         "PROGRESO 4/7 Calculando scores del modelo",
         "PROGRESO 5/7 Aplicando reglas de negocio",
         "PROGRESO 6/7 Comparando segmentos propuestos",
-        "PROGRESO 7/7 Midiendo deriva de datos",
+        "PROGRESO 7/7 Deriva no medida (simulación)",
     ]
     lineas_csv = [l for l in salida.splitlines() if l.startswith("RESULTADO_CSV ")]
     assert len(lineas_csv) == 1
@@ -418,6 +418,35 @@ def test_comando_scorear_no_lanza_si_hay_fallidos(monkeypatch):
     resultado = main.comando_scorear(dry_run=False)  # no debe lanzar
 
     assert resultado == 1
+
+
+def test_comando_scorear_en_dry_run_no_mide_ni_registra_la_deriva(monkeypatch, tmp_path):
+    """La simulación promete no escribir en la base: medir_deriva() inserta
+    en dbo.DriftMedicion, así que en dry_run no se llama."""
+    _aislar_controles_scorear(monkeypatch)
+    llamadas = []
+    monkeypatch.setattr(drift, "medir_deriva", lambda *a, **k: llamadas.append(1) or pd.DataFrame())
+    monkeypatch.setattr(main, "LOGS_DIR", tmp_path)
+    df_clientes = pd.DataFrame([_fila_cliente_prueba().drop("score")], index=pd.Index([1], name="ClienteId"))
+    monkeypatch.setattr(extract, "extraer_features", lambda: df_clientes)
+    monkeypatch.setattr(score, "calcular_scores", lambda df: pd.DataFrame({"score": [415.0]}, index=df.index))
+    monkeypatch.setattr(rules, "asignar_segmento", lambda s: 3)
+    monkeypatch.setattr(rules, "aplicar_overrides", lambda cliente, seg_id: "ALTO")
+    monkeypatch.setattr(rules, "resolver_segmento_final", lambda seg_id, codigo: 3)
+    monkeypatch.setattr(rules, "recomendar_plazo", lambda codigo: 2)
+    monkeypatch.setattr(rules, "clasificar_cliente", lambda cliente: "B")
+    monkeypatch.setattr(rules, "resolver_clasificacion_id", lambda codigo: 2)
+    monkeypatch.setattr(rules, "marcar_revision", lambda cliente, codigo: False)
+    monkeypatch.setattr(
+        writeback, "guardar_resultados",
+        lambda df, dry_run=False, **k: {"modo": "simulacion" if dry_run else "real", "total": 1,
+                                        "cambiaron_segmento": [], "sin_cambios": [1], "fallidos": []},
+    )
+    main.comando_scorear(dry_run=True)
+    assert llamadas == []
+
+    main.comando_scorear(dry_run=False)
+    assert llamadas == [1]
 
 
 def test_comando_scorear_no_falla_si_la_deriva_no_se_puede_medir(monkeypatch):

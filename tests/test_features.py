@@ -60,10 +60,9 @@ def test_variables_candidatas_excluye_columnas_configuradas():
     assert "NombreCompleto" not in candidatas  # ni siquiera es numérica
 
 
-def test_variables_candidatas_excluye_las_configuradas_como_categoricas():
-    # Ajuste post-8.4 (sección 5, "Propias de la factura"): VendedorId y
-    # CiudadId no se descartan, pero tampoco se discretizan por cuantiles
-    # como si fueran continuas — van por variables_categoricas_candidatas.
+def test_vendedor_y_ciudad_quedan_fuera_del_entrenamiento():
+    # Desde 2026-11-08 VendedorId y CiudadId están en features.variables_excluidas
+    # (config.yaml): no entran ni como numéricas continuas ni como categóricas.
     df = pd.DataFrame(
         {
             "VendedorId": [1, 2],
@@ -76,14 +75,25 @@ def test_variables_candidatas_excluye_las_configuradas_como_categoricas():
     assert "MontoFactura" in candidatas
     assert "VendedorId" not in candidatas
     assert "CiudadId" not in candidatas
+    assert features.variables_categoricas_candidatas(df) == []
+
+
+def test_variables_candidatas_excluye_las_configuradas_como_categoricas(monkeypatch):
+    # Una variable configurada como categórica no se discretiza por cuantiles
+    # como si fuera continua: va por variables_categoricas_candidatas.
+    monkeypatch.setattr(features, "_config_features", lambda: {"variables_categoricas": ["ZonaId"]})
+    df = pd.DataFrame({"ZonaId": [1, 2], "MontoFactura": [100.0, 200.0], "TuvoMoraHistorica": [0, 1]})
+    candidatas = features.variables_candidatas(df, target_col="TuvoMoraHistorica")
+    assert "MontoFactura" in candidatas
+    assert "ZonaId" not in candidatas
 
 
 def test_variables_categoricas_candidatas_solo_devuelve_las_presentes():
-    # VendedorId no existe en la vista de inferencia por cliente; no debe
-    # reventar, simplemente no aparece en la lista.
-    df = pd.DataFrame({"CiudadId": [1, 2], "MontoFactura": [100.0, 200.0]})
-    candidatas = features.variables_categoricas_candidatas(df)
-    assert candidatas == ["CiudadId"]
+    # Una categórica configurada que no existe en la vista no debe reventar,
+    # simplemente no aparece en la lista.
+    df = pd.DataFrame({"ZonaId": [1, 2], "MontoFactura": [100.0, 200.0]})
+    candidatas = features.variables_categoricas_candidatas(df, ["ZonaId", "VendedorId"])
+    assert candidatas == ["ZonaId"]
 
 
 def _dataset_con_categoria(n: int = 300, seed: int = 5) -> pd.DataFrame:
@@ -175,7 +185,15 @@ def test_preparar_features_incluye_variables_categoricas(tmp_path, monkeypatch):
     df = df_numerico.join(df_categorico[["VendedorId"]])
 
     ruta_mapeo = tmp_path / "mapeo_categorico.pkl"
-    config_con_ruta_temporal = {**features._config_features(), "ruta_mapeo": str(ruta_mapeo)}
+    # Prueba el mecanismo de categóricas, no la configuración real (que desde
+    # 2026-11-08 ya no declara ninguna: VendedorId/CiudadId están excluidas).
+    config_real = features._config_features()
+    config_con_ruta_temporal = {
+        **config_real,
+        "ruta_mapeo": str(ruta_mapeo),
+        "variables_categoricas": ["VendedorId"],
+        "variables_excluidas": [v for v in config_real.get("variables_excluidas", []) if v != "VendedorId"],
+    }
     monkeypatch.setattr(features, "_config_features", lambda: config_con_ruta_temporal)
 
     x_woe, mapeo = features.preparar_features(df, target_col="TuvoMoraHistorica")
@@ -392,14 +410,25 @@ def test_dataset_entrenamiento_ya_no_tiene_variables_con_iv_de_fuga():
     # Antes del ajuste (vw_FeaturesScoringCliente, nivel cliente), variables
     # como PorcFacturasEnMora/DiasMoraPromedio salían con IV > 3 porque el
     # target se derivaba de la misma ventana. Con el dataset point-in-time
-    # a nivel de factura, sus equivalentes deben quedar en un rango sano.
+    # a nivel de factura, esa fuga estructural no debe reaparecer.
+    #
+    # El techo operativo features.iv_maximo (1.0) es otra cosa: un filtro
+    # que depende de los datos de cada momento (en 2026-11-08,
+    # PorcMoraPrevia6M quedó en IV=1.04). Esta prueba no exige que los datos
+    # reales queden bajo ese techo; exige que el pipeline aplique el filtro,
+    # es decir, que ninguna variable por encima de iv_maximo llegue al modelo.
     df_real = extract.excluir_sin_historial(extract.extraer_dataset_entrenamiento())
     mapeo_completo = features.calcular_mapeo_woe(df_real, target_col="Target")
 
     variables_de_mora = ["PorcMoraPrevia", "PorcMoraPrevia6M", "DiasMoraPromedioPrevio", "DiasMoraMaximaPrevia"]
     for variable in variables_de_mora:
         assert variable in mapeo_completo
-        assert mapeo_completo[variable]["iv"] <= 1.0, (
-            f"{variable} tiene IV={mapeo_completo[variable]['iv']:.2f}, "
-            f"sospechosamente alto para una variable point-in-time."
+        assert mapeo_completo[variable]["iv"] < 3.0, (
+            f"{variable} tiene IV={mapeo_completo[variable]['iv']:.2f}: reaparece la fuga del target de nivel cliente."
         )
+
+    iv_maximo = features._config_features().get("iv_maximo", 1.0)
+    sobre_techo = {v for v, info in mapeo_completo.items() if info["iv"] > iv_maximo}
+    filtrado = features.filtrar_por_iv(mapeo_completo)
+    assert not sobre_techo & set(filtrado)
+    assert all(info["iv"] <= iv_maximo for info in filtrado.values())

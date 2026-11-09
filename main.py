@@ -282,6 +282,13 @@ def comando_scorear(dry_run: bool, clientes_ids: list[int] | None = None) -> int
     if reporte["fallidos"]:
         logger.error("Clientes que fallaron al escribir: %s", ", ".join(str(c) for c in reporte["fallidos"]))
 
+    if dry_run:
+        # medir_deriva() persiste cada medición en dbo.DriftMedicion: una
+        # simulación ("sin escribir en la base de datos") no debe hacerlo.
+        logger.info("Simulación: la deriva no se mide (se registraría en dbo.DriftMedicion).")
+        _reportar_progreso(7, TOTAL_ETAPAS_SCOREAR, "Deriva no medida (simulación)")
+        return reporte["total"]
+
     try:
         bundle = train.cargar_modelo()
         version_modelo = bundle.get("version_modelo") or bundle.get("fecha_entrenamiento", "desconocida")
@@ -295,7 +302,7 @@ def comando_scorear(dry_run: bool, clientes_ids: list[int] | None = None) -> int
         )
     except Exception as exc:
         # La deriva nunca bloquea el pipeline: un fallo al medirla no
-        # invalida un scoring que ya se ejecutó (o simuló) correctamente.
+        # invalida un scoring que ya se ejecutó correctamente.
         logger.warning("No se pudo medir la deriva tras el scoring: %s", exc)
 
     _reportar_progreso(7, TOTAL_ETAPAS_SCOREAR, "Midiendo deriva de datos")

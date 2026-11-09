@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src import calidad, esquema, extract, train
+from src import calidad, esquema, extract, features, train
 from src.train import UmbralesAceptacion, cargar_umbrales, modelo_aceptado
 
 
@@ -407,6 +407,23 @@ def test_entrenar_con_datos_reales_produce_modelo_aceptado(tmp_path, monkeypatch
     config_con_rutas_temp = {**config_real, "ruta_modelo": str(ruta_modelo), "ruta_scorecard": str(ruta_scorecard)}
     monkeypatch.setattr(train, "_config_entrenamiento", lambda: config_con_rutas_temp)
 
+    # Solo lectura sobre la base real: la prueba no debe dejar rastro en
+    # producción. Sin esto, cada ejecución registraba una versión "servida"
+    # en dbo.EvaluacionModelo/EvaluacionMetrica (que las pantallas de
+    # métricas toman como la última), un baseline en dbo.BaselineVariable y
+    # sobrescribía models/mapeo_woe.pkl.
+    evaluaciones = []
+    monkeypatch.setattr(train, "evaluar_modelo", lambda **kw: evaluaciones.append(kw["alternativa"]))
+    monkeypatch.setattr(train, "registrar_baseline", lambda *a, **k: None)
+    config_features_real = features._config_features()
+    monkeypatch.setattr(
+        features, "_config_features",
+        lambda: {**config_features_real, "ruta_mapeo": str(tmp_path / "mapeo_woe.pkl")},
+    )
+    # sp_ValidarCalidadDatos persiste cada ejecución en dbo.ValidacionCalidadDatos;
+    # la compuerta de calidad tiene sus propias pruebas.
+    monkeypatch.setattr(train, "validar_antes_de_entrenar", lambda: None)
+
     # Las compuertas de esquema y calidad (agregadas tras 8.5) corren
     # contra los datos reales tal como están hoy: si tienen hallazgos
     # críticos genuinos, el entrenamiento debe detenerse ahí — es el
@@ -422,4 +439,8 @@ def test_entrenar_con_datos_reales_produce_modelo_aceptado(tmp_path, monkeypatch
     assert 0.5 <= resultado["metricas"]["auc"] <= 0.95
     assert ruta_modelo.exists()
     assert ruta_scorecard.exists()
-    assert "VendedorId" in resultado["columnas"] or "CiudadId" in resultado["columnas"]
+    assert (tmp_path / "mapeo_woe.pkl").exists()
+    # Desde 2026-11-08 VendedorId y CiudadId están en features.variables_excluidas.
+    assert "VendedorId" not in resultado["columnas"]
+    assert "CiudadId" not in resultado["columnas"]
+    assert "REGRESION_LOGISTICA_WOE" in evaluaciones

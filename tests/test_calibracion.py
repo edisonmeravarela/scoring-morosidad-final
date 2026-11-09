@@ -182,7 +182,7 @@ def test_rechaza_entradas_mal_formadas():
 # ===========================================================================
 # 8. Verificacion contra los datos reales
 # ===========================================================================
-def test_calibracion_sobre_el_conjunto_real_vivo():
+def test_calibracion_sobre_el_conjunto_real_vivo(tmp_path, monkeypatch):
     """Reproduce el calculo del reporte contra la base real.
 
     Se omite si el entorno no tiene acceso a la base. Usa el mismo split que
@@ -209,6 +209,13 @@ def test_calibracion_sobre_el_conjunto_real_vivo():
         min_filas_validacion=config.get("min_filas_validacion", 30),
         min_positivos_validacion=config.get("min_positivos_validacion", 10),
         estricto=config.get("particion_estricta", False),
+    )
+    # preparar_features() guarda el mapeo en features.ruta_mapeo: a un
+    # directorio temporal, no sobre models/mapeo_woe.pkl.
+    config_features_real = features._config_features()
+    monkeypatch.setattr(
+        features, "_config_features",
+        lambda: {**config_features_real, "ruta_mapeo": str(tmp_path / "mapeo_woe.pkl")},
     )
     X_tr, mapeo = features.preparar_features(tr, target_col)
     X_va = features.transformar_a_woe(va, mapeo)

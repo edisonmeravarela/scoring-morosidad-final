@@ -207,6 +207,46 @@ def test_construir_detalle_variables_valor_original_none_sin_equivalente_de_clie
     assert fila["Puntos"] == 0.0
 
 
+def test_variable_neutralizada_no_aporta_al_score_ni_aparece_en_el_detalle(monkeypatch):
+    """score.variables_neutralizadas fija la variable en WOE=0 al inferir:
+    el score deja de incluir su aporte, no genera fila en el detalle y la
+    suma del detalle coincide con el score."""
+    target = pd.Series([0, 0, 0, 1, 1, 1, 0, 1, 0, 1])
+    ciudad = pd.Series([1, 1, 1, 2, 2, 2, 1, 2, 1, 2])
+    monto = pd.Series([1, 2, 3, 8, 9, 10, 2, 9, 3, 8])
+    mapeo = {
+        "CiudadId": features.calcular_woe_categoria(ciudad, target, min_conteo=1),
+        "MontoFactura": features.calcular_woe_variable(monto, target, n_tramos=2),
+    }
+    columnas = ["MontoFactura", "CiudadId"]
+    x = features.transformar_a_woe(pd.DataFrame({"MontoFactura": monto, "CiudadId": ciudad}), mapeo)
+    modelo = LogisticRegression().fit(x[columnas], target)
+    bundle = {"modelo": modelo, "mapeo": mapeo, "columnas": columnas}
+    monkeypatch.setattr(score, "cargar_modelo", lambda ruta_modelo=None: bundle)
+
+    df_cliente = pd.DataFrame({"MontoFactura": [9], "CiudadId": [2]}, index=pd.Index([7], name="ClienteId"))
+    config = {"mapa_variables_inferencia": {}, "variables_neutralizadas": []}
+    monkeypatch.setattr(score, "_config_score", lambda: config)
+    score_con_ciudad = score.calcular_scores(df_cliente)["score"].iloc[0]
+    detalle_con_ciudad = score.construir_detalle_variables(df_cliente)[7]
+    ciudad_pts = [f["Puntos"] for f in detalle_con_ciudad if f["Variable"] == "CiudadId"][0]
+    assert ciudad_pts != 0
+
+    config["variables_neutralizadas"] = ["CiudadId"]
+    score_sin_ciudad = score.calcular_scores(df_cliente)["score"].iloc[0]
+    detalle = score.construir_detalle_variables(df_cliente)[7]
+
+    assert [f["Variable"] for f in detalle] == ["(base)", "MontoFactura"]
+    assert [f["Orden"] for f in detalle] == [0, 1]
+    assert abs(score_sin_ciudad - (score_con_ciudad - ciudad_pts)) <= 1.0  # ya no incluye Ciudad
+    assert abs(sum(f["Puntos"] for f in detalle) - score_sin_ciudad) <= 1.0  # el detalle cuadra
+
+
+def test_config_real_neutraliza_ciudad_y_vendedor():
+    neutralizadas = score._config_score().get("variables_neutralizadas", [])
+    assert "CiudadId" in neutralizadas and "VendedorId" in neutralizadas
+
+
 def test_construir_detalle_variables_no_deja_tipos_numpy_en_el_resultado(monkeypatch):
     """modelo.coef_/intercept_/df.at[...] son tipos numpy (np.float64,
     np.int64) — sin convertirlos a tipos nativos de Python, pyodbc puede no
@@ -234,14 +274,16 @@ def test_construir_detalle_variables_no_deja_tipos_numpy_en_el_resultado(monkeyp
 
 
 def test_construir_detalle_variables_con_modelo_real_la_suma_de_puntos_reproduce_el_score():
-    # Verificación en vivo: la suma de "Puntos" de todas las filas (incluida
-    # la base) debe reproducir el score de calcular_scores() para el mismo
-    # cliente, salvo el margen de redondeo (±1) que introduce el score_min/
-    # score_max/round() final de calcular_scores.
+    # Verificación en vivo (solo lectura): la suma de "Puntos" de todas las
+    # filas (base y variables) debe reproducir el score de calcular_scores()
+    # para el mismo cliente, salvo el margen de redondeo (±1) del round()
+    # final; las variables neutralizadas no aparecen ni aportan.
     df_clientes = extract.extraer_features()
     scores = score.calcular_scores(df_clientes)
     detalle = score.construir_detalle_variables(df_clientes)
+    ocultas = set(score._config_score().get("variables_neutralizadas", []))
 
-    for cliente_id in df_clientes.index[:5]:
+    for cliente_id in df_clientes.index:
+        assert not any(f["Variable"] in ocultas for f in detalle[cliente_id])
         suma_puntos = sum(f["Puntos"] for f in detalle[cliente_id])
-        assert abs(suma_puntos - scores.loc[cliente_id, "score"]) <= 1.0
+        assert abs(suma_puntos - scores.loc[cliente_id, "score"]) <= 1.0, cliente_id
