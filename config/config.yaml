@@ -38,9 +38,21 @@ features:
   # Columnas de las vistas que no se discretizan/WOE-codifican en absoluto:
   # identificador, texto libre, catálogos ya asignados (estado actual, no
   # comportamiento) y, en la vista de entrenamiento, claves e indicadores
-  # de filtro. VendedorId/CiudadId NO van aquí: son "Propias de la factura"
-  # (sección 5 del documento) y se codifican como categóricas, no se excluyen.
+  # de filtro.
+  #
+  # VendedorId y CiudadId (antes categóricas "Propias de la factura",
+  # sección 5 del documento) quedan EXCLUIDAS desde el 2026-11-08: el
+  # próximo entrenamiento no las usa. Deben ir en esta lista y no solo
+  # fuera de variables_categoricas: siendo enteras, variables_candidatas()
+  # las tomaría como numéricas continuas. El modelo servido hoy
+  # (models/modelo.pkl, versión 20261027_172037) se entrenó con CiudadId y
+  # tiene un coeficiente para ella; al inferir se neutraliza (ver
+  # score.variables_neutralizadas). LimiteCreditoVigente y
+  # PorcUtilizacionLimite (cupo) existen solo en la vista de inferencia y
+  # ningún modelo las ha usado.
   variables_excluidas:
+    - VendedorId
+    - CiudadId
     # dbo.vw_FeaturesScoringCliente (inferencia)
     - NombreCompleto
     - SegmentoActualId
@@ -53,12 +65,10 @@ features:
     - FechaVencimiento
     - SinHistorialPago
   # Variables sin orden natural: se codifican con WOE por categoría (cada
-  # valor distinto es su propio tramo), no por cuantiles. VendedorId no
-  # existe en vw_FeaturesScoringCliente y CiudadId existe en ambas vistas;
+  # valor distinto es su propio tramo), no por cuantiles;
   # variables_categoricas_candidatas() solo usa las que estén presentes.
-  variables_categoricas:
-    - VendedorId
-    - CiudadId
+  # Vacía desde que VendedorId y CiudadId pasaron a variables_excluidas.
+  variables_categoricas: []
 
 entrenamiento:
   # Columnas del dataset de dbo.vw_DatasetEntrenamientoFactura relevantes
@@ -142,6 +152,17 @@ score:
     FacturasAbiertasEmision: NumFacturasConSaldo
     SaldoVencidoEmision: null
     VendedorId: null   # no existe en vw_FeaturesScoringCliente (no es una columna de cliente)
+  # Variables retiradas del modelo (2026-11-08) aunque el modelo servido
+  # tenga coeficiente para ellas: al inferir se fijan en WOE=0 (sin aporte,
+  # igual que las de mapa_variables_inferencia: null) y no generan fila en
+  # dbo.ScoringDetalleVariable, así que el score y la suma del detalle
+  # coinciden. Esto SÍ cambia el score respecto de usar CiudadId (entre
+  # -17,7 y +11,8 puntos por cliente con el modelo 20261027_172037). El
+  # archivo del modelo no se modifica; al reentrenar sin estas variables
+  # (features.variables_excluidas), esta lista deja de tener efecto.
+  variables_neutralizadas:
+    - CiudadId
+    - VendedorId
   # Rango nominal del score tipo FICO (documento, sección 7: "0 a 1000").
   score_min: 0
   score_max: 1000

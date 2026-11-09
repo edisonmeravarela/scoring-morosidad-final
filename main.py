@@ -10,6 +10,7 @@ documento "Controles de Esquema, Calidad y Deriva de Datos").
     python main.py scorear               # Ídem, ejecución real con escritura en base de datos
     python main.py scorear --clientes 101,205   # Ídem, acotado a esos ClienteId (reevaluación bajo demanda)
     python main.py monitorear            # Desempeño en producción y desviación de datos (paso 8.9)
+    python main.py calibrar              # Recalibra las probabilidades del modelo vigente (ver docs/11_README_corrida_definitiva.md)
 
 Cada subcomando corre envuelto en _ejecutar_con_bitacora(), que registra
 inicio, fin, duración, número de registros procesados y errores en
@@ -34,7 +35,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from src import calidad, drift, esquema, extract, monitor, rules, score, train, writeback
+from src import calidad, db, drift, esquema, extract, monitor, rules, score, train, writeback
 from src.config import RAIZ_PROYECTO, cargar_config
 
 LOGS_DIR = RAIZ_PROYECTO / "logs"
@@ -281,6 +282,13 @@ def comando_scorear(dry_run: bool, clientes_ids: list[int] | None = None) -> int
     if reporte["fallidos"]:
         logger.error("Clientes que fallaron al escribir: %s", ", ".join(str(c) for c in reporte["fallidos"]))
 
+    if dry_run:
+        # medir_deriva() persiste cada medición en dbo.DriftMedicion: una
+        # simulación ("sin escribir en la base de datos") no debe hacerlo.
+        logger.info("Simulación: la deriva no se mide (se registraría en dbo.DriftMedicion).")
+        _reportar_progreso(7, TOTAL_ETAPAS_SCOREAR, "Deriva no medida (simulación)")
+        return reporte["total"]
+
     try:
         bundle = train.cargar_modelo()
         version_modelo = bundle.get("version_modelo") or bundle.get("fecha_entrenamiento", "desconocida")
@@ -294,7 +302,7 @@ def comando_scorear(dry_run: bool, clientes_ids: list[int] | None = None) -> int
         )
     except Exception as exc:
         # La deriva nunca bloquea el pipeline: un fallo al medirla no
-        # invalida un scoring que ya se ejecutó (o simuló) correctamente.
+        # invalida un scoring que ya se ejecutó correctamente.
         logger.warning("No se pudo medir la deriva tras el scoring: %s", exc)
 
     _reportar_progreso(7, TOTAL_ETAPAS_SCOREAR, "Midiendo deriva de datos")
@@ -327,6 +335,43 @@ def comando_monitorear() -> int:
     return registros_procesados
 
 
+def _evaluacion_id_servida() -> int:
+    """Resuelve el EvaluacionId del modelo actualmente servido
+    (dbo.EvaluacionModelo.EsModeloServido = 1) — mismo criterio usado para
+    distinguir el modelo real de corridas de prueba (ver
+    reporte_calibracion.py)."""
+    fila = db.consultar_escalar(
+        "SELECT EvaluacionId FROM dbo.EvaluacionModelo WHERE EsModeloServido = 1"
+    )
+    if fila is None:
+        raise RuntimeError(
+            "No hay un modelo marcado como EsModeloServido=1 en "
+            "dbo.EvaluacionModelo; no se puede calibrar."
+        )
+    return int(fila)
+
+
+def comando_calibrar() -> int:
+    """Calibración probabilística del modelo vigente
+    (reporte_calibracion.ejecutar_calibracion_definitiva): reconstruye las
+    predicciones fuera de muestra de validación cruzada y ventana
+    temporal, decide si hace falta corrección (criterio en
+    src/calibracion.py:recomendar_calibrador), persiste en
+    dbo.CalibracionModelo y, si corresponde, guarda el calibrador elegido
+    en models/calibrador.pkl."""
+    import reporte_calibracion as repcal
+
+    evaluacion_id = _evaluacion_id_servida()
+    resultado = repcal.ejecutar_calibracion_definitiva(
+        evaluacion_id, persistir=True, aplicar=True
+    )
+    logger.info(
+        "Calibración completa (EvaluacionId=%d): calibrador principal=%s, guardado=%s.",
+        evaluacion_id, resultado["calibrador_principal"], resultado["calibrador_guardado"],
+    )
+    return sum(r["n"] for r in resultado["resultados"].values())
+
+
 def construir_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="main.py", description="Orquestador del pipeline de scoring de morosidad.")
     subparsers = parser.add_subparsers(dest="comando", required=True)
@@ -349,6 +394,8 @@ def construir_parser() -> argparse.ArgumentParser:
     )
 
     subparsers.add_parser("monitorear", help="Evalúa el desempeño en producción y detecta desviación de datos (paso 8).")
+
+    subparsers.add_parser("calibrar", help="Recalibra las probabilidades del modelo vigente y, si corresponde, guarda un calibrador nuevo.")
 
     return parser
 
@@ -373,6 +420,8 @@ def main(argv: list[str] | None = None) -> int:
         return _ejecutar_con_bitacora(nombre, lambda: comando_scorear(args.dry_run, clientes_ids))
     if args.comando == "monitorear":
         return _ejecutar_con_bitacora("monitorear", comando_monitorear)
+    if args.comando == "calibrar":
+        return _ejecutar_con_bitacora("calibrar", comando_calibrar)
 
     parser.error(f"Comando no reconocido: {args.comando}")
     return 2

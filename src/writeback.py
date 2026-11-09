@@ -15,6 +15,7 @@ ejecución real (documento, sección 8.11).
 """
 
 import logging
+import re
 
 import pandas as pd
 
@@ -105,6 +106,32 @@ def _insertar_detalle_variables(conn, historial_id: int, filas: list[dict]) -> N
         )
 
 
+_PATRON_SCORE_MOTIVO = re.compile(r"\(score: -?[\d.]+\)$")
+
+
+def _corregir_ultimo_historial(conn, historial_id: int, score: float, filas: list[dict]) -> bool:
+    """Cuando sp_ActualizarScoringCliente no inserta fila (no cambió el
+    segmento ni la clasificación), la última fila del historial sigue
+    mostrando el score y el detalle de un cálculo anterior. Aquí se
+    reescriben el "(score: …)" de su Motivo y su detalle con el cálculo
+    actual, para que el total que muestra el frontend coincida con la suma
+    del detalle. Solo se tocan filas generadas por el scoring (Motivo con
+    "(score: …)"); una recalificación manual no se modifica. Devuelve si
+    corrigió."""
+    motivo = conn.exec_driver_sql(
+        "SELECT Motivo FROM dbo.ClienteRiesgoHistorial WHERE HistorialId = ?", (historial_id,)
+    ).scalar()
+    if not motivo or not _PATRON_SCORE_MOTIVO.search(motivo):
+        return False
+    nuevo_motivo = _PATRON_SCORE_MOTIVO.sub(f"(score: {float(score):.2f})", motivo)
+    conn.exec_driver_sql(
+        "UPDATE dbo.ClienteRiesgoHistorial SET Motivo = ? WHERE HistorialId = ?", (nuevo_motivo, historial_id)
+    )
+    conn.exec_driver_sql("DELETE FROM dbo.ScoringDetalleVariable WHERE HistorialId = ?", (historial_id,))
+    _insertar_detalle_variables(conn, historial_id, filas)
+    return True
+
+
 def _valor_opcional(fila: pd.Series, columna: str):
     valor = fila.get(columna)
     return None if pd.isna(valor) else valor
@@ -130,9 +157,12 @@ def guardar_resultados(
 
     `detalle_variables`, si se indica (score.construir_detalle_variables()),
     persiste en dbo.ScoringDetalleVariable el desglose por variable de cada
-    cliente — pero solo para los que de verdad recibieron una fila nueva en
-    dbo.ClienteRiesgoHistorial (detectado comparando el HistorialId antes/
-    después de cada EXEC, en la misma transacción); nunca en dry_run."""
+    cliente: si recibió una fila nueva en dbo.ClienteRiesgoHistorial
+    (detectado comparando el HistorialId antes/después de cada EXEC, en la
+    misma transacción), el detalle va con esa fila; si no, se corrigen el
+    score y el detalle de su última fila de scoring
+    (_corregir_ultimo_historial), para que el total mostrado y la suma del
+    detalle coincidan tras cada recálculo. Nunca en dry_run."""
     if df.index.name == "ClienteId":
         df = df.reset_index()
 
@@ -143,7 +173,7 @@ def guardar_resultados(
     segmento_vigente = _segmento_actual_por_cliente(df["ClienteId"].tolist())
     historial_vigente = _ultimo_historial_por_cliente(df["ClienteId"].tolist()) if detalle_variables else {}
 
-    cambiaron, sin_cambios, fallidos = [], [], []
+    cambiaron, sin_cambios, fallidos, historial_corregido = [], [], [], []
     engine = get_engine()
 
     for inicio in range(0, len(df), tamano_lote):
@@ -176,6 +206,10 @@ def guardar_resultados(
                         nuevo_historial_id = _historial_actual(conn, cliente_id)
                         if nuevo_historial_id > historial_vigente.get(cliente_id, 0):
                             _insertar_detalle_variables(conn, nuevo_historial_id, detalle_variables[cliente_id])
+                        elif nuevo_historial_id and _corregir_ultimo_historial(
+                            conn, nuevo_historial_id, float(fila["ScoreRiesgo"]), detalle_variables[cliente_id]
+                        ):
+                            historial_corregido.append(cliente_id)
                 except Exception as exc:
                     logger.error("Falló la actualización del cliente %d: %s", cliente_id, exc)
                     fallidos.append(cliente_id)
@@ -186,13 +220,16 @@ def guardar_resultados(
         "cambiaron_segmento": cambiaron,
         "sin_cambios": sin_cambios,
         "fallidos": fallidos,
+        "historial_corregido": historial_corregido,
     }
     logger.info(
-        "Writeback (%s): %d clientes procesados, %d cambiaron de segmento, %d sin cambios, %d fallidos.",
+        "Writeback (%s): %d clientes procesados, %d cambiaron de segmento, %d sin cambios, %d fallidos, "
+        "%d con la última fila del historial corregida.",
         resultado["modo"],
         resultado["total"],
         len(cambiaron),
         len(sin_cambios),
         len(fallidos),
+        len(historial_corregido),
     )
     return resultado

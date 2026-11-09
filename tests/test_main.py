@@ -6,7 +6,7 @@ import pandas as pd
 import pytest
 
 import main
-from src import calidad, drift, esquema, extract, monitor, rules, score, train, writeback
+from src import calidad, db, drift, esquema, extract, monitor, rules, score, train, writeback
 
 
 def _veredicto_calidad_ok() -> dict:
@@ -172,7 +172,7 @@ def test_comando_scorear_arma_resultados_y_delega_en_writeback(monkeypatch, tmp_
         "PROGRESO 4/7 Calculando scores del modelo",
         "PROGRESO 5/7 Aplicando reglas de negocio",
         "PROGRESO 6/7 Comparando segmentos propuestos",
-        "PROGRESO 7/7 Midiendo deriva de datos",
+        "PROGRESO 7/7 Deriva no medida (simulación)",
     ]
     lineas_csv = [l for l in salida.splitlines() if l.startswith("RESULTADO_CSV ")]
     assert len(lineas_csv) == 1
@@ -420,6 +420,35 @@ def test_comando_scorear_no_lanza_si_hay_fallidos(monkeypatch):
     assert resultado == 1
 
 
+def test_comando_scorear_en_dry_run_no_mide_ni_registra_la_deriva(monkeypatch, tmp_path):
+    """La simulación promete no escribir en la base: medir_deriva() inserta
+    en dbo.DriftMedicion, así que en dry_run no se llama."""
+    _aislar_controles_scorear(monkeypatch)
+    llamadas = []
+    monkeypatch.setattr(drift, "medir_deriva", lambda *a, **k: llamadas.append(1) or pd.DataFrame())
+    monkeypatch.setattr(main, "LOGS_DIR", tmp_path)
+    df_clientes = pd.DataFrame([_fila_cliente_prueba().drop("score")], index=pd.Index([1], name="ClienteId"))
+    monkeypatch.setattr(extract, "extraer_features", lambda: df_clientes)
+    monkeypatch.setattr(score, "calcular_scores", lambda df: pd.DataFrame({"score": [415.0]}, index=df.index))
+    monkeypatch.setattr(rules, "asignar_segmento", lambda s: 3)
+    monkeypatch.setattr(rules, "aplicar_overrides", lambda cliente, seg_id: "ALTO")
+    monkeypatch.setattr(rules, "resolver_segmento_final", lambda seg_id, codigo: 3)
+    monkeypatch.setattr(rules, "recomendar_plazo", lambda codigo: 2)
+    monkeypatch.setattr(rules, "clasificar_cliente", lambda cliente: "B")
+    monkeypatch.setattr(rules, "resolver_clasificacion_id", lambda codigo: 2)
+    monkeypatch.setattr(rules, "marcar_revision", lambda cliente, codigo: False)
+    monkeypatch.setattr(
+        writeback, "guardar_resultados",
+        lambda df, dry_run=False, **k: {"modo": "simulacion" if dry_run else "real", "total": 1,
+                                        "cambiaron_segmento": [], "sin_cambios": [1], "fallidos": []},
+    )
+    main.comando_scorear(dry_run=True)
+    assert llamadas == []
+
+    main.comando_scorear(dry_run=False)
+    assert llamadas == [1]
+
+
 def test_comando_scorear_no_falla_si_la_deriva_no_se_puede_medir(monkeypatch):
     _aislar_controles_scorear(monkeypatch)
     monkeypatch.setattr(drift, "medir_deriva", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("sin baseline")))
@@ -547,6 +576,45 @@ def test_comando_monitorear_suma_observaciones_y_variables(monkeypatch):
     monkeypatch.setattr(monitor, "detectar_drift", lambda: pd.DataFrame({"variable": ["A"], "psi": [0.1], "alerta": [False]}))
 
     assert main.comando_monitorear() == 26
+
+
+# ---------- comando_calibrar ----------
+
+
+def test_parser_calibrar():
+    args = main.construir_parser().parse_args(["calibrar"])
+    assert args.comando == "calibrar"
+
+
+def test_evaluacion_id_servida_devuelve_el_id(monkeypatch):
+    monkeypatch.setattr(db, "consultar_escalar", lambda *a, **k: 105)
+    assert main._evaluacion_id_servida() == 105
+
+
+def test_evaluacion_id_servida_sin_modelo_servido_lanza(monkeypatch):
+    monkeypatch.setattr(db, "consultar_escalar", lambda *a, **k: None)
+    with pytest.raises(RuntimeError, match="EsModeloServido"):
+        main._evaluacion_id_servida()
+
+
+def test_comando_calibrar_resuelve_evaluacion_id_y_delega(monkeypatch):
+    import reporte_calibracion as repcal
+
+    llamadas = []
+
+    def _fake_ejecutar(evaluacion_id, **kwargs):
+        llamadas.append((evaluacion_id, kwargs))
+        return {
+            "resultados": {"crossval": {"n": 197}, "ventana": {"n": 40}},
+            "calibrador_principal": "NINGUNO",
+            "calibrador_guardado": None,
+        }
+
+    monkeypatch.setattr(db, "consultar_escalar", lambda *a, **k: 105)
+    monkeypatch.setattr(repcal, "ejecutar_calibracion_definitiva", _fake_ejecutar)
+
+    assert main.comando_calibrar() == 237  # 197 + 40
+    assert llamadas == [(105, {"persistir": True, "aplicar": True})]
 
 
 # ---------- Verificación en vivo: pipeline completo ensamblado por primera vez ----------

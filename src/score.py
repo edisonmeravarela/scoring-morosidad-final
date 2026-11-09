@@ -79,11 +79,17 @@ def _construir_features_inferencia(df: pd.DataFrame, mapeo: dict, columnas_model
     equivalente disponible en `df` quedan en WOE=0 (sin contribución al
     score), preservando el orden y la cantidad de columnas que el modelo
     espera."""
-    mapa_variables = _config_score().get("mapa_variables_inferencia", {})
+    config_score = _config_score()
+    mapa_variables = config_score.get("mapa_variables_inferencia", {})
+    neutralizadas = set(config_score.get("variables_neutralizadas", []) or [])
 
     columnas_traducidas = {}
     sin_equivalente = []
     for variable_modelo in columnas_modelo:
+        if variable_modelo in neutralizadas:
+            # Retirada del modelo (config.yaml: score.variables_neutralizadas):
+            # WOE=0, sin contribución, igual que una variable sin equivalente.
+            continue
         variable_vista = mapa_variables.get(variable_modelo, variable_modelo)
         if variable_vista and variable_vista in df.columns:
             columnas_traducidas[variable_modelo] = df[variable_vista]
@@ -159,6 +165,10 @@ def construir_detalle_variables(df: pd.DataFrame, ruta_modelo=None) -> dict[int,
     sintética "(base)" (offset - factor*intercept) para que la suma de
     puntos de todas las filas reproduzca el score final.
 
+    Las variables de score.variables_neutralizadas (config.yaml) no generan
+    fila: _construir_features_inferencia() ya las deja en WOE=0, así que no
+    aportan puntos ni al score ni al detalle, y la suma sigue cuadrando.
+
     Pensado para persistirse junto a cada fila nueva de
     dbo.ClienteRiesgoHistorial (src/writeback.py): no tiene sentido
     reconstruirlo para scores pasados, porque extraer_features() consulta
@@ -168,7 +178,9 @@ def construir_detalle_variables(df: pd.DataFrame, ruta_modelo=None) -> dict[int,
     modelo = bundle["modelo"]
     mapeo = bundle["mapeo"]
     columnas_modelo = bundle["columnas"]
-    mapa_variables = _config_score().get("mapa_variables_inferencia", {})
+    config_score = _config_score()
+    mapa_variables = config_score.get("mapa_variables_inferencia", {})
+    neutralizadas = set(config_score.get("variables_neutralizadas", []) or [])
 
     x_woe = _construir_features_inferencia(df, mapeo, columnas_modelo)
     factor, offset = factor_offset()
@@ -191,6 +203,8 @@ def construir_detalle_variables(df: pd.DataFrame, ruta_modelo=None) -> dict[int,
             }
         ]
         for variable in columnas_modelo:
+            if variable in neutralizadas:
+                continue  # WOE=0 -> 0 puntos; retirada del modelo, no se muestra
             variable_vista = mapa_variables.get(variable, variable)
             valor_original = None
             if variable_vista and variable_vista in df.columns:

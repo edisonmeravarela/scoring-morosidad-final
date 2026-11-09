@@ -141,19 +141,59 @@ def test_guardar_resultados_inserta_detalle_cuando_hay_fila_nueva_de_historial(m
     assert inserciones == [(11, detalle_variables[1])]
 
 
-def test_guardar_resultados_no_inserta_detalle_si_no_cambio_el_historial(monkeypatch):
+def test_guardar_resultados_corrige_la_ultima_fila_si_no_cambio_el_historial(monkeypatch):
+    """Sin fila nueva (no cambió segmento ni clasificación), el detalle no
+    se inserta como fila nueva: se corrigen el score y el detalle de la
+    última fila del historial con el cálculo actual."""
     monkeypatch.setattr(writeback, "_ejecutar_sp", lambda *a, **k: None)
     monkeypatch.setattr(writeback, "_segmento_actual_por_cliente", lambda ids: {})
     monkeypatch.setattr(writeback, "_ultimo_historial_por_cliente", lambda ids: {1: 10})
     monkeypatch.setattr(writeback, "_historial_actual", lambda conn, cliente_id: 10)  # sin cambio
 
-    inserciones = []
+    inserciones, correcciones = [], []
     monkeypatch.setattr(writeback, "_insertar_detalle_variables", lambda conn, hid, filas: inserciones.append((hid, filas)))
+    monkeypatch.setattr(
+        writeback, "_corregir_ultimo_historial",
+        lambda conn, hid, score, filas: correcciones.append((hid, score, filas)) or True,
+    )
 
     detalle_variables = {1: [{"Variable": "(base)", "Etiqueta": "Puntaje base", "ValorOriginal": None, "WOE": None, "Puntos": 600.0, "Orden": 0}]}
-    writeback.guardar_resultados(_resultados_prueba(), dry_run=False, detalle_variables=detalle_variables)
+    resultado = writeback.guardar_resultados(_resultados_prueba(), dry_run=False, detalle_variables=detalle_variables)
 
     assert inserciones == []
+    assert correcciones == [(10, 415.0, detalle_variables[1])]
+    assert resultado["historial_corregido"] == [1]
+
+
+class _ConexionFalsa:
+    """Registra las sentencias; responde el Motivo pedido al SELECT."""
+
+    def __init__(self, motivo):
+        self.motivo = motivo
+        self.sentencias = []
+
+    def exec_driver_sql(self, sql, params=None):
+        self.sentencias.append((sql.split()[0], params))
+        motivo = self.motivo
+        return type("R", (), {"scalar": lambda self: motivo})()
+
+
+def test_corregir_ultimo_historial_reescribe_score_y_detalle():
+    conn = _ConexionFalsa("Actualización automática por modelo de scoring (segmento MEDIO, clasificación B) (score: 505.00)")
+    filas = [{"Variable": "(base)", "Etiqueta": "Puntaje base", "ValorOriginal": None, "WOE": None, "Puntos": 511.0, "Orden": 0}]
+
+    assert writeback._corregir_ultimo_historial(conn, 327, 511, filas) is True
+
+    tipos = [s[0] for s in conn.sentencias]
+    assert tipos == ["SELECT", "UPDATE", "DELETE", "INSERT"]
+    assert conn.sentencias[1][1] == (
+        "Actualización automática por modelo de scoring (segmento MEDIO, clasificación B) (score: 511.00)", 327)
+
+
+def test_corregir_ultimo_historial_no_toca_una_recalificacion_manual():
+    conn = _ConexionFalsa("Recalificación manual por el área de crédito")
+    assert writeback._corregir_ultimo_historial(conn, 50, 600, []) is False
+    assert [s[0] for s in conn.sentencias] == ["SELECT"]
 
 
 def test_guardar_resultados_sin_detalle_variables_no_consulta_historial(monkeypatch):
@@ -339,6 +379,39 @@ def test_guardar_resultados_real_con_detalle_variables_del_modelo_real_no_falla_
             read_sql(f"SELECT COUNT(*) AS n FROM dbo.ScoringDetalleVariable WHERE HistorialId={historial_id}")["n"].iloc[0]
         )
         assert n_filas == len(filas_detalle)
+    finally:
+        _eliminar_cliente_prueba(cliente_id)
+
+
+def test_recalculo_sin_cambio_de_segmento_corrige_score_y_detalle_de_la_ultima_fila(_sin_dobles):
+    """Segundo cálculo con otro score pero el mismo segmento: no se crea
+    fila nueva, pero la última fila pasa a mostrar el score nuevo y un
+    detalle cuya suma coincide con él."""
+    cliente_id = None
+
+    def _detalle(base, var):
+        return [
+            {"Variable": "(base)", "Etiqueta": "Puntaje base", "ValorOriginal": None, "WOE": None, "Puntos": base, "Orden": 0},
+            {"Variable": "MontoFactura", "Etiqueta": "Valor promedio de factura", "ValorOriginal": 100, "WOE": 0.1, "Puntos": var, "Orden": 1},
+        ]
+
+    def _df(score_):
+        return pd.DataFrame({"ClienteId": [cliente_id], "ScoreRiesgo": [score_], "SegmentoRiesgoId": [2],
+                             "ClasificacionId": [2], "PlazoPagoRecomendadoId": [3]})
+
+    try:
+        cliente_id = _crear_cliente_prueba(segmento_inicial=3)
+        writeback.guardar_resultados(_df(505.0), dry_run=False, detalle_variables={cliente_id: _detalle(484.425, 20.575)})
+        resultado = writeback.guardar_resultados(_df(511.0), dry_run=False, detalle_variables={cliente_id: _detalle(484.425, 26.575)})
+
+        assert resultado["historial_corregido"] == [cliente_id]
+        historial = read_sql(f"SELECT HistorialId, Motivo FROM dbo.ClienteRiesgoHistorial WHERE ClienteId={cliente_id}")
+        assert len(historial) == 1  # no se agregó fila
+        assert historial.iloc[0]["Motivo"].endswith("(score: 511.00)")
+        suma = float(read_sql(
+            f"SELECT SUM(Puntos) AS s FROM dbo.ScoringDetalleVariable WHERE HistorialId={int(historial.iloc[0]['HistorialId'])}"
+        )["s"].iloc[0])
+        assert abs(suma - 511.0) < 0.01
     finally:
         _eliminar_cliente_prueba(cliente_id)
 
