@@ -38,8 +38,45 @@ class DatosInsuficientesError(Exception):
     entrenamiento sea representativo."""
 
 
-def _extraer_vista(vista: str, minimo_filas: int, unidad: str, indice: str) -> pd.DataFrame:
-    df = read_sql(f"SELECT * FROM {vista}")
+COLUMNAS_HISTORIAL = "ClienteId, FacturasResueltas, UmbralVigente, TieneHistorial"
+
+
+def _origen_dataset(vista: str, fecha_corte: datetime | None = None) -> tuple[str, str, tuple | None]:
+    """Consulta del conjunto de entrenamiento: (sql, nombre para el log,
+    parámetros). Sin fecha de corte es la vista de siempre, que toma las
+    facturas vencidas a la fecha del sistema (GETDATE()). Con fecha de
+    corte se usa dbo.fn_DatasetEntrenamientoFactura(@FechaCorte), creada
+    en FechaCorte_Parametrizacion.sql con la misma lógica que la vista
+    (probada fila a fila: con la fecha actual devuelven exactamente lo
+    mismo)."""
+    if fecha_corte is None:
+        return f"SELECT * FROM {vista}", vista, None
+    return (
+        "SELECT * FROM dbo.fn_DatasetEntrenamientoFactura(?)",
+        f"dbo.fn_DatasetEntrenamientoFactura({fecha_corte.isoformat(sep=' ')})",
+        (fecha_corte,),
+    )
+
+
+def _origen_historial(fecha_corte: datetime | None = None) -> tuple[str, tuple | None]:
+    """Igual que _origen_dataset() para el historial evaluable:
+    dbo.vw_HistorialClienteActual (fecha del sistema) o
+    dbo.fn_HistorialClientesACorte(@FechaCorte)."""
+    if fecha_corte is None:
+        return f"SELECT {COLUMNAS_HISTORIAL} FROM dbo.vw_HistorialClienteActual", None
+    return f"SELECT {COLUMNAS_HISTORIAL} FROM dbo.fn_HistorialClientesACorte(?)", (fecha_corte,)
+
+
+def _extraer_vista(
+    vista: str,
+    minimo_filas: int,
+    unidad: str,
+    indice: str,
+    sql: str | None = None,
+    params: tuple | None = None,
+) -> pd.DataFrame:
+    consulta = sql or f"SELECT * FROM {vista}"
+    df = read_sql(consulta, params) if params else read_sql(consulta)
     fecha_extraccion = datetime.now()
 
     if len(df) < minimo_filas:
@@ -69,20 +106,25 @@ def extraer_features() -> pd.DataFrame:
     return _extraer_vista(vista, minimo, "clientes", "ClienteId")
 
 
-def extraer_dataset_entrenamiento() -> pd.DataFrame:
+def extraer_dataset_entrenamiento(fecha_corte: datetime | None = None) -> pd.DataFrame:
     """Consulta dbo.vw_DatasetEntrenamientoFactura (una fila por factura,
     variables point-in-time) y devuelve un DataFrame indexado por
     FacturaId. Uso: entrenamiento (train.py).
+
+    `fecha_corte` (opcional) reconstruye el conjunto tal como estaba a
+    esa fecha vía dbo.fn_DatasetEntrenamientoFactura; sin ella, el
+    comportamiento es el de siempre.
 
     Mismo criterio de registro/aborto que extraer_features(), sobre
     config.extract.minimo_facturas (30 por defecto)."""
     cfg = cargar_config().get("extract", {})
     vista = cfg.get("vista_entrenamiento", "dbo.vw_DatasetEntrenamientoFactura")
     minimo = cfg.get("minimo_facturas", 30)
-    return _extraer_vista(vista, minimo, "facturas", "FacturaId")
+    sql, origen, params = _origen_dataset(vista, fecha_corte)
+    return _extraer_vista(origen, minimo, "facturas", "FacturaId", sql=sql, params=params)
 
 
-def agregar_historial_evaluable(df: pd.DataFrame) -> pd.DataFrame:
+def agregar_historial_evaluable(df: pd.DataFrame, fecha_corte: datetime | None = None) -> pd.DataFrame:
     """Incorpora FacturasResueltas/UmbralVigente/TieneHistorial desde
     dbo.vw_HistorialClienteActual, indexado por ClienteId igual que
     extraer_features() — fuente única del criterio de "historial
@@ -95,10 +137,12 @@ def agregar_historial_evaluable(df: pd.DataFrame) -> pd.DataFrame:
     vencimiento ya hubiera transcurrido — un tercer criterio divergente
     de los otros dos. Paso aparte, igual que excluir_sin_historial(), no
     integrado en extraer_features(): mantiene esa función simple y
-    permite probarlo por separado."""
-    historial = read_sql(
-        "SELECT ClienteId, FacturasResueltas, UmbralVigente, TieneHistorial FROM dbo.vw_HistorialClienteActual"
-    ).set_index("ClienteId")
+    permite probarlo por separado.
+
+    `fecha_corte` (opcional) evalúa el historial a esa fecha vía
+    dbo.fn_HistorialClientesACorte en vez de a la fecha del sistema."""
+    sql, params = _origen_historial(fecha_corte)
+    historial = (read_sql(sql, params) if params else read_sql(sql)).set_index("ClienteId")
     return df.join(historial, how="left")
 
 

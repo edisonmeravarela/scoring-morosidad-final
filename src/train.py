@@ -42,7 +42,7 @@ from src.ajustes_evaluacion import (
 )
 from src.calidad import validar_antes_de_entrenar
 from src.config import RAIZ_PROYECTO, cargar_config
-from src.db import consultar_escalar
+from src.db import consultar_escalar, exec_sp
 from src.drift import registrar_baseline
 from src.esquema import validar_esquema
 from src.evaluacion import evaluar_modelo
@@ -360,7 +360,35 @@ def cargar_modelo(ruta_modelo=None) -> dict:
     return joblib.load(ruta)
 
 
-def entrenar() -> dict:
+def registrar_fecha_corte(evaluacion_id: int, fecha_corte: datetime, df: pd.DataFrame, target_col: str) -> None:
+    """EXEC dbo.sp_RegistrarFechaCorte: deja en dbo.EvaluacionFechaCorte
+    (tabla satélite de dbo.EvaluacionModelo, ver
+    FechaCorte_Parametrizacion.sql) la fecha de corte con que se extrajo
+    el conjunto de esa evaluación, sus filas entrenables y sus
+    incumplimientos. Con esa fecha, `python main.py reconstruir-dataset`
+    reproduce el mismo conjunto más adelante."""
+    exec_sp(
+        "dbo.sp_RegistrarFechaCorte",
+        {
+            "EvaluacionId": int(evaluacion_id),
+            "FechaCorte": fecha_corte,
+            "FilasDataset": int(len(df)),
+            "Incumplimientos": int(df[target_col].sum()),
+            "Fuente": "ENTRENAMIENTO",
+        },
+    )
+
+
+def _registrar_fecha_corte_segura(evaluacion: dict, fecha_corte: datetime, df: pd.DataFrame, target_col: str, version: str) -> None:
+    """Igual que el registro de la evaluación: un fallo aquí nunca
+    interrumpe el entrenamiento."""
+    try:
+        registrar_fecha_corte(evaluacion["EvaluacionId"], fecha_corte, df, target_col)
+    except Exception as exc:
+        logger.error("No se pudo registrar la fecha de corte de la versión %s: %s", version, exc)
+
+
+def entrenar(fecha_corte: datetime | None = None) -> dict:
     """Orquesta el paso 8.5 completo. Devuelve el dict con el modelo, el
     mapeo WOE, las columnas del modelo y las métricas de validación.
     Lanza ModeloRechazadoError sin escribir nada en models/ si el modelo
@@ -374,7 +402,13 @@ def entrenar() -> dict:
     reglas de negocio sobre una estructura que cambió) y 2) calidad
     (src.calidad.validar_antes_de_entrenar, bloquea solo ante críticos).
     Cualquiera de los dos puede lanzar antes de tocar los datos de
-    entrenamiento."""
+    entrenamiento.
+
+    `fecha_corte` (opcional): entrena con el conjunto tal como estaba a
+    esa fecha (dbo.fn_DatasetEntrenamientoFactura). Sin ella se extrae de
+    la vista, como siempre, y se toma como fecha de corte el momento en
+    que empieza la extracción. En ambos casos la fecha queda registrada
+    en dbo.EvaluacionFechaCorte junto a cada evaluación."""
     validar_esquema()
     validar_antes_de_entrenar()
 
@@ -382,7 +416,12 @@ def entrenar() -> dict:
     target_col = config.get("columna_target", "Target")
     umbrales = cargar_umbrales(consultar=_consultar_parametro_scoring)
 
-    df = extraer_dataset_entrenamiento()
+    if fecha_corte is None:
+        fecha_corte_registro = datetime.now().replace(microsecond=0)
+        df = extraer_dataset_entrenamiento()
+    else:
+        fecha_corte_registro = fecha_corte.replace(microsecond=0)
+        df = extraer_dataset_entrenamiento(fecha_corte=fecha_corte)
     if config.get("excluir_sin_historial", True):
         df = excluir_sin_historial(df)
 
@@ -437,7 +476,7 @@ def entrenar() -> dict:
     cliente_col = config.get("columna_cliente", "ClienteId")
 
     try:
-        evaluar_modelo(
+        evaluacion_rl = evaluar_modelo(
             version_modelo=marca_tiempo,
             alternativa="REGRESION_LOGISTICA_WOE",
             es_modelo_servido=True,
@@ -454,6 +493,7 @@ def entrenar() -> dict:
             score_min=score_min,
             score_max=score_max,
         )
+        _registrar_fecha_corte_segura(evaluacion_rl, fecha_corte_registro, df, target_col, marca_tiempo)
     except Exception as exc:
         # La evaluación es un registro de auditoría adicional; un fallo
         # aquí no debe impedir que el modelo se acepte o se rechace por
@@ -468,7 +508,7 @@ def entrenar() -> dict:
             ks_xgb = calcular_ks(y_val, proba_xgb)
             logger.info("Validación (XGBoost, solo comparación): AUC=%.4f, KS=%.4f.", auc_xgb, ks_xgb)
             try:
-                evaluar_modelo(
+                evaluacion_xgb = evaluar_modelo(
                     version_modelo=marca_tiempo,
                     alternativa="XGBOOST",
                     es_modelo_servido=False,
@@ -485,6 +525,7 @@ def entrenar() -> dict:
                     score_min=score_min,
                     score_max=score_max,
                 )
+                _registrar_fecha_corte_segura(evaluacion_xgb, fecha_corte_registro, df, target_col, marca_tiempo)
             except Exception as exc:
                 logger.error("No se pudo registrar la evaluación de XGBOOST para la versión %s: %s", marca_tiempo, exc)
         except DatosInsuficientesError:
