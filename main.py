@@ -11,6 +11,8 @@ documento "Controles de Esquema, Calidad y Deriva de Datos").
     python main.py scorear --clientes 101,205   # Ídem, acotado a esos ClienteId (reevaluación bajo demanda)
     python main.py monitorear            # Desempeño en producción y desviación de datos (paso 8.9)
     python main.py calibrar              # Recalibra las probabilidades del modelo vigente (ver docs/11_README_corrida_definitiva.md)
+    python main.py reconstruir-dataset --fecha-corte "2026-10-27 17:20:35"
+                                         # Conjunto de entrenamiento a esa fecha, sin entrenar (FechaCorte_Parametrizacion.sql)
 
 Cada subcomando corre envuelto en _ejecutar_con_bitacora(), que registra
 inicio, fin, duración, número de registros procesados y errores en
@@ -372,6 +374,44 @@ def comando_calibrar() -> int:
     return sum(r["n"] for r in resultado["resultados"].values())
 
 
+def comando_reconstruir_dataset(fecha_corte_texto: str) -> int:
+    """Reconstruye el conjunto de entrenamiento tal como estaba a una
+    fecha de corte (dbo.fn_DatasetEntrenamientoFactura), con el mismo
+    filtro que aplica train.entrenar() (excluir_sin_historial), y lo
+    guarda en logs/dataset_corte_<fecha>.csv. Solo lectura: no entrena,
+    no toca models/ ni escribe en la base. Añade como columnas
+    informativas el historial evaluable del cliente a esa fecha
+    (dbo.fn_HistorialClientesACorte); no se usan para filtrar, igual que
+    en el entrenamiento."""
+    fecha_corte = datetime.fromisoformat(fecha_corte_texto)
+    config = train._config_entrenamiento()
+    target_col = config.get("columna_target", "Target")
+
+    df = extract.extraer_dataset_entrenamiento(fecha_corte=fecha_corte)
+    filas_vista = len(df)
+    if config.get("excluir_sin_historial", True):
+        df = extract.excluir_sin_historial(df)
+    # agregar_historial_evaluable() une por el índice ClienteId; este
+    # conjunto está indexado por FacturaId.
+    df = (
+        extract.agregar_historial_evaluable(df.reset_index().set_index("ClienteId"), fecha_corte=fecha_corte)
+        .reset_index()
+        .set_index("FacturaId")
+        .sort_index()
+    )
+
+    ruta = LOGS_DIR / f"dataset_corte_{fecha_corte:%Y%m%d_%H%M%S}.csv"
+    df.to_csv(ruta, encoding="utf-8")
+    incumplimientos = int(df[target_col].sum())
+    mensaje = (
+        f"Fecha de corte: {fecha_corte.isoformat(sep=' ')} | Filas de la función: {filas_vista} | "
+        f"Filas entrenables: {len(df)} | Incumplimientos: {incumplimientos} | Archivo: {ruta}"
+    )
+    print(mensaje)
+    logger.info(mensaje)
+    return len(df)
+
+
 def construir_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="main.py", description="Orquestador del pipeline de scoring de morosidad.")
     subparsers = parser.add_subparsers(dest="comando", required=True)
@@ -396,6 +436,11 @@ def construir_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("monitorear", help="Evalúa el desempeño en producción y detecta desviación de datos (paso 8).")
 
     subparsers.add_parser("calibrar", help="Recalibra las probabilidades del modelo vigente y, si corresponde, guarda un calibrador nuevo.")
+
+    parser_reconstruir = subparsers.add_parser(
+        "reconstruir-dataset", help="Reconstruye el conjunto de entrenamiento a una fecha de corte, sin entrenar (solo lectura)."
+    )
+    parser_reconstruir.add_argument("--fecha-corte", required=True, help='Fecha y hora ISO, p. ej. "2026-10-27 17:20:35".')
 
     return parser
 
@@ -422,6 +467,11 @@ def main(argv: list[str] | None = None) -> int:
         return _ejecutar_con_bitacora("monitorear", comando_monitorear)
     if args.comando == "calibrar":
         return _ejecutar_con_bitacora("calibrar", comando_calibrar)
+    if args.comando == "reconstruir-dataset":
+        return _ejecutar_con_bitacora(
+            f"reconstruir-dataset --fecha-corte {args.fecha_corte}",
+            lambda: comando_reconstruir_dataset(args.fecha_corte),
+        )
 
     parser.error(f"Comando no reconocido: {args.comando}")
     return 2

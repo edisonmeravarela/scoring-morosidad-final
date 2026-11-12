@@ -21,6 +21,9 @@ def _aislar_controles_previos(monkeypatch) -> None:
     monkeypatch.setattr(train, "validar_esquema", lambda: _veredicto_esquema_ok())
     monkeypatch.setattr(train, "validar_antes_de_entrenar", lambda: _veredicto_calidad_ok())
     monkeypatch.setattr(train, "registrar_baseline", lambda *a, **k: {"filas_categoricas": 0, "filas_numericas": 0})
+    # El EvaluacionId simulado (1) existe en la bitácora real: sin esto
+    # se escribiría una fila de prueba en dbo.EvaluacionFechaCorte.
+    monkeypatch.setattr(train, "registrar_fecha_corte", lambda *a, **k: None)
     monkeypatch.setattr(
         train,
         "evaluar_modelo",
@@ -415,6 +418,7 @@ def test_entrenar_con_datos_reales_produce_modelo_aceptado(tmp_path, monkeypatch
     evaluaciones = []
     monkeypatch.setattr(train, "evaluar_modelo", lambda **kw: evaluaciones.append(kw["alternativa"]))
     monkeypatch.setattr(train, "registrar_baseline", lambda *a, **k: None)
+    monkeypatch.setattr(train, "registrar_fecha_corte", lambda *a, **k: None)
     config_features_real = features._config_features()
     monkeypatch.setattr(
         features, "_config_features",
